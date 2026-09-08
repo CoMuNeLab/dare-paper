@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ps-dare"
+version = "0.1.0"
+description = "Assemble PS-DARE case, weather, and pollution datasets."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.9",
+    "pandas>=3.0.3",
+    "python-dotenv",
+]
+
+[project.scripts]
+ps-dare-explorer = "ps_dare.explorer:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

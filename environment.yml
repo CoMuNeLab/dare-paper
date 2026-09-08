@@ -1,0 +1,23 @@
+name: ps-dare-paper
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - matplotlib
+  - numpy
+  # Existing result pickles were produced with this pandas serialization.
+  - pandas=3.0.3
+  - pmdarima
+  - python-dotenv
+  - scikit-learn
+  - scipy
+  - statsmodels
+  - lxml
+  - r-base
+  - r-dplyr
+  - r-ggplot2
+  - r-ggrepel
+  - r-readr
+  - pip
+  - pip:
+      - -e .
