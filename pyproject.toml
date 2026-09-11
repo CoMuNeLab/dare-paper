@@ -11,11 +11,13 @@ requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.9",
     "pandas>=3.0.3",
+    "pmdarima",
     "python-dotenv",
 ]
 
 [project.scripts]
 ps-dare-explorer = "ps_dare.explorer:main"
+ps-dare-predict = "ps_dare.predict_arima:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
