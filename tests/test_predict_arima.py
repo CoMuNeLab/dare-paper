@@ -1,10 +1,14 @@
+import json
+import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
 from ps_dare.predict_arima import (
+    _forecast_order_isolated,
     forecast_order,
     orders_timestamp,
     read_orders,
@@ -42,6 +46,20 @@ class RecordingArima:
         self.update_calls.append((list(y), None if X is None else X.copy()))
         self.history.extend(y)
         return self
+
+    def aic(self):
+        return 123.5
+
+    def params(self):
+        # Depending on history makes the test verify extraction happens before updates.
+        return [float(len(self.history)), 0.25]
+
+    @property
+    def arima_res_(self):
+        class Result:
+            param_names = ["ar.L1", "sigma2"]
+
+        return Result()
 
 
 def order_row(dataset: Path, driver: str = "none", lag: str = "0") -> pd.Series:
@@ -128,6 +146,11 @@ class PredictArimaTests(unittest.TestCase):
         self.assertEqual(result["date_end_training"].unique().tolist(), ["2024-01-15"])
         self.assertEqual(result["date_end_testing"].unique().tolist(), ["2024-01-29"])
         self.assertEqual(result["prediction_horizon"].unique().tolist(), [1])
+        self.assertEqual(result["training_aic"].unique().tolist(), [123.5])
+        self.assertEqual(
+            json.loads(result["fitted_parameters"].iloc[0]),
+            {"ar.L1": 3.0, "sigma2": 0.25},
+        )
 
     def test_passes_lagged_driver_to_fit_predict_and_update(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -149,6 +172,45 @@ class PredictArimaTests(unittest.TestCase):
         pd.testing.assert_frame_equal(first_prediction_X, first_update_X)
         self.assertEqual(result["drivers_used"].unique().tolist(), ["NO2_mean"])
         self.assertEqual(result["driver_value"].tolist(), [1, 2, 3, 4, 5, 6])
+
+    def test_serializes_initial_fit_before_rolling_updates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self._dataset(root)
+            model_path = root / "models" / "general" / "model.pkl"
+            forecast_order(
+                order_row(path),
+                model_class=RecordingArima,
+                model_output_path=model_path,
+            )
+
+            with model_path.open("rb") as stream:
+                saved_model = pickle.load(stream)
+
+        self.assertEqual(saved_model.history, [10, 11, 12])
+        self.assertEqual(saved_model.update_calls, [])
+
+    def test_worker_saves_each_completed_simulation_immediately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self._dataset(root)
+            model_path = root / "models" / "model.pkl"
+            prediction_path = root / "predictions" / "model.csv"
+            completed = pd.DataFrame(
+                {"model_id": ["model_001_general_none"], "prediction": [12.0]}
+            )
+            with patch(
+                "ps_dare.predict_arima.forecast_order", return_value=completed
+            ) as mocked_forecast:
+                output = _forecast_order_isolated(
+                    (order_row(path), 0, model_path, prediction_path)
+                )
+
+            self.assertEqual(output, prediction_path)
+            self.assertTrue(prediction_path.is_file())
+            saved = pd.read_csv(prediction_path)
+            self.assertEqual(saved["model_id"].nunique(), 1)
+            self.assertEqual(mocked_forecast.call_args.kwargs["model_output_path"], model_path)
 
     def test_missing_testing_driver_ends_testing_phase(self):
         with tempfile.TemporaryDirectory() as temporary:

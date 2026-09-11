@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -30,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 
 CASE_COLUMN = "n_accesses"
 # Every training timestep must be strictly above its aggregation's threshold.
-MIN_CASES_PER_TIMESTEP = {"weekly": 1, "monthly": 100}
+MIN_CASES_PER_TIMESTEP = {"weekly": 1, "monthly": 10}
 FREQUENCIES = {
     "week": "weekly",
     "weekly": "weekly",
@@ -41,6 +42,8 @@ FREQUENCIES = {
 SEASONAL_PERIODS = {"weekly": 52, "monthly": 12}
 DRIVER_KINDS = {"pollution", "weather", "none", "forced"}
 DISCRETIZATIONS = {"discrete", "continuous"}
+SELECTED_DRIVER_COLUMN = "_selected_driver"
+MODEL_NUMBER_COLUMN = "model_number"
 FORCED_ORDER = (1, 1, 1)
 FORCED_SEASONAL_ORDER = (2, 0, 0)
 FORCED_INTERCEPT = True
@@ -184,6 +187,7 @@ def load_training_file(path: Path) -> pd.DataFrame:
         frame = pd.read_pickle(path)
     else:
         frame = pd.read_csv(path)
+    frame.columns = frame.columns.astype(str).str.strip()
     return frame.loc[:, ~frame.columns.astype(str).str.startswith("Unnamed:")]
 
 
@@ -327,7 +331,15 @@ def analyze_dataset(
     drivers = select_drivers(data, kind)
     if kind in DRIVERS_BY_KIND and not drivers:
         raise ValueError(f"No listed {kind} drivers found in {path}")
-    driver_sets = [[driver] for driver in drivers] if drivers else [[]]
+    selected_driver = row.get(SELECTED_DRIVER_COLUMN)
+    if selected_driver is None or pd.isna(selected_driver):
+        driver_sets = [[driver] for driver in drivers] if drivers else [[]]
+    elif str(selected_driver) == "":
+        driver_sets = [[]]
+    elif str(selected_driver) not in drivers:
+        raise ValueError(f"Driver {selected_driver!r} is unavailable in {path}")
+    else:
+        driver_sets = [[str(selected_driver)]]
 
     from pmdarima import ARIMA, auto_arima as pmd_auto_arima
 
@@ -381,8 +393,7 @@ def analyze_dataset(
             driver_label,
         )
 
-        results.append(
-            {
+        result = {
                 "aggregation": frequency,
                 "discretization": discretization,
                 "category": str(category),
@@ -408,8 +419,138 @@ def analyze_dataset(
                 "seasonal_period": m,
                 "intercept": bool(model.with_intercept),
             }
-        )
+        if MODEL_NUMBER_COLUMN in row:
+            result[MODEL_NUMBER_COLUMN] = int(row[MODEL_NUMBER_COLUMN])
+        results.append(result)
     return results
+
+
+def _expanded_model_rows(
+    configuration: pd.DataFrame,
+) -> tuple[list[pd.Series], list[dict[str, object]]]:
+    """Expand configuration rows into one independently runnable row per model."""
+    model_rows: list[pd.Series] = []
+    skipped_records: list[dict[str, object]] = []
+    model_number = 0
+
+    for _, row in configuration.iterrows():
+        frequency = _frequency(row["aggregation"])
+        discretization = _discretization(row["discretization"])
+        kind = _driver_kind(row["driver_kind"])
+        path = _dataset_path(row["dataset"], frequency, discretization)
+        frame = load_training_file(path)
+        category = row.get("category", ALL_CATEGORIES)
+        if pd.isna(category) or not str(category).strip():
+            category = ALL_CATEGORIES
+        data = prepare_timeseries(frame, frequency, str(category))
+        start = pd.to_datetime(row["train_start"])
+        end = pd.to_datetime(row["train_end"])
+        training = continuous_training_period(data, start, end, frequency)
+        y = pd.to_numeric(training[CASE_COLUMN], errors="coerce").fillna(0)
+        case_threshold = MIN_CASES_PER_TIMESTEP[frequency]
+        below_threshold = y.le(case_threshold)
+
+        if y.empty or below_threshold.any():
+            skipped_records.append(
+                {
+                    "dataset": str(row["dataset"]),
+                    "aggregation": frequency,
+                    "discretization": discretization,
+                    "category": str(category),
+                    "driver_kind": kind,
+                    "lag": str(row["lag"]),
+                    "path_to_training_file": str(path),
+                    "date_start_training": start.date().isoformat(),
+                    "date_end_training": end.date().isoformat(),
+                    "date_end_testing": (
+                        "" if pd.isna(row.get("test_end")) else str(row.get("test_end"))
+                    ),
+                    "minimum_cases": y.min() if not y.empty else None,
+                    "case_threshold": case_threshold,
+                    "timesteps_at_or_below_threshold": int(below_threshold.sum()),
+                    "reason": (
+                        "no observations in the training period"
+                        if y.empty
+                        else "not all training timesteps have more than "
+                        f"{case_threshold} cases"
+                    ),
+                }
+            )
+            continue
+
+        drivers = select_drivers(data, kind)
+        if kind in DRIVERS_BY_KIND and not drivers:
+            raise ValueError(f"No listed {kind} drivers found in {path}")
+        selected_drivers: list[str | None] = drivers if drivers else [None]
+        for driver in selected_drivers:
+            model_number += 1
+            model_row = row.copy()
+            model_row[SELECTED_DRIVER_COLUMN] = "" if driver is None else driver
+            model_row[MODEL_NUMBER_COLUMN] = model_number
+            model_rows.append(model_row)
+
+    return model_rows, skipped_records
+
+
+def _model_slug(record: dict[str, object]) -> str:
+    """Build the stable identifier shared by one-row order artifacts."""
+    dataset = Path(str(record["path_to_training_file"])).stem
+    driver = str(record["drivers_used"])
+    label = re.sub(r"[^a-zA-Z0-9]+", "_", f"{dataset}_{driver}").strip("_").lower()
+    return f"model_{int(record[MODEL_NUMBER_COLUMN]):03d}_{label}"
+
+
+def _save_model_order(record: dict[str, object], timestamp: str) -> Path:
+    """Immediately save one completed order search to its own CSV."""
+    output = solve_path(
+        Path("data")
+        / str(record["aggregation"])
+        / "orders"
+        / timestamp
+        / _model_slug(record)
+        / f"orders_{timestamp}.csv"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([record]).to_csv(output, index=False)
+    LOGGER.info("Saved completed model order to %s", output)
+    return output
+
+
+def _analyze_and_save_model(task: tuple[pd.Series, str]) -> Path:
+    """Select and persist exactly one model without returning fitted state."""
+    row, timestamp = task
+    results = analyze_dataset(row)
+    if len(results) != 1:
+        raise RuntimeError(f"Expected exactly one model result, got {len(results)}")
+    return _save_model_order(results[0], timestamp)
+
+
+def iter_run(configuration_path: str | Path, jobs: int = 1):
+    """Yield durable per-model order files as soon as their searches finish."""
+    if jobs < 1:
+        raise ValueError("jobs must be at least 1")
+    configuration = read_configuration(configuration_path)
+    LOGGER.info(
+        "Loaded %s analysis specification(s) from %s",
+        len(configuration),
+        solve_path(configuration_path),
+    )
+    model_rows, skipped_records = _expanded_model_rows(configuration)
+    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    tasks = [(row, timestamp) for row in model_rows]
+
+    if jobs == 1:
+        for task in tasks:
+            yield _analyze_and_save_model(task)
+    else:
+        LOGGER.info("Selecting orders with %s worker processes", jobs)
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            futures = [executor.submit(_analyze_and_save_model, task) for task in tasks]
+            for future in as_completed(futures):
+                # Each worker has already written its one-row order file.
+                yield future.result()
+
+    yield from save_skipped(pd.DataFrame(skipped_records))
 
 
 def save_results(results: pd.DataFrame) -> list[Path]:
@@ -445,8 +586,18 @@ def save_skipped(skipped: pd.DataFrame) -> list[Path]:
     return outputs
 
 
-def run(configuration_path: str | Path) -> list[Path]:
+def _analyze_dataset_isolated(
+    row: pd.Series,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Analyze one row without sharing mutable state between worker processes."""
+    skipped: list[dict[str, object]] = []
+    return analyze_dataset(row, skipped), skipped
+
+
+def run(configuration_path: str | Path, jobs: int = 1) -> list[Path]:
     """Analyze eligible rows and save orders plus details of skipped datasets."""
+    if jobs < 1:
+        raise ValueError("jobs must be at least 1")
     configuration = read_configuration(configuration_path)
     LOGGER.info(
         "Loaded %s analysis specification(s) from %s",
@@ -455,8 +606,18 @@ def run(configuration_path: str | Path) -> list[Path]:
     )
     result_records: list[dict[str, object]] = []
     skipped_records: list[dict[str, object]] = []
-    for _, row in configuration.iterrows():
-        result_records.extend(analyze_dataset(row, skipped_records))
+    rows = [row for _, row in configuration.iterrows()]
+    if jobs == 1:
+        analyses = (_analyze_dataset_isolated(row) for row in rows)
+        for results, skipped in analyses:
+            result_records.extend(results)
+            skipped_records.extend(skipped)
+    else:
+        LOGGER.info("Analyzing configuration rows with %s worker processes", jobs)
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            for results, skipped in executor.map(_analyze_dataset_isolated, rows):
+                result_records.extend(results)
+                skipped_records.extend(skipped)
 
     outputs = save_results(pd.DataFrame(result_records))
     outputs.extend(save_skipped(pd.DataFrame(skipped_records)))
@@ -467,8 +628,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("configuration", help="CSV file describing datasets to analyze")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="configuration rows to process concurrently (default: %(default)s)",
+    )
     args = parser.parse_args()
-    for output in run(args.configuration):
+    for output in run(args.configuration, jobs=args.jobs):
         print(f"Saved {output}")
 
 

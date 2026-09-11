@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from ps_dare.auto_arima import run
+from ps_dare.auto_arima import iter_run, run
 
 
 class FakeModel:
@@ -19,6 +19,45 @@ class FakeModel:
 
 
 class AutoArimaThresholdTests(unittest.TestCase):
+    def test_loads_files_with_whitespace_around_column_names(self):
+        from ps_dare.auto_arima import load_training_file
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "spaced.csv"
+            pd.DataFrame({" valid_time ": ["2024-01-01"], " n_accesses": [11]}).to_csv(
+                path, index=False
+            )
+
+            result = load_training_file(path)
+
+        self.assertEqual(result.columns.tolist(), ["valid_time", "n_accesses"])
+
+    def test_pipeline_writes_a_separate_order_file_per_completed_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = self._dataset(root, "eligible", "weekly", [11, 12, 13])
+            configuration = root / "configuration.csv"
+            pd.DataFrame(
+                [self._configuration_row(dataset, "weekly")]
+            ).to_csv(configuration, index=False)
+            fake_pmdarima = ModuleType("pmdarima")
+            fake_pmdarima.auto_arima = lambda y, **parameters: FakeModel(
+                parameters["m"]
+            )
+            fake_pmdarima.ARIMA = object
+
+            with (
+                patch.dict(os.environ, {"DATA_BASE_DIR": str(root)}),
+                patch.dict(sys.modules, {"pmdarima": fake_pmdarima}),
+            ):
+                outputs = list(iter_run(configuration))
+
+            self.assertEqual(len(outputs), 1)
+            self.assertRegex(outputs[0].name, r"orders_\d{8}_\d{6}\.csv")
+            saved = pd.read_csv(outputs[0])
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved["model_number"].tolist(), [1])
+
     def _dataset(
         self,
         root: Path,

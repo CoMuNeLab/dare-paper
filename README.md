@@ -56,25 +56,54 @@ Estimate the model orders based on the discretization , driver, time limits, and
 python -m src.ps_dare.auto_arima /Users/tommasobertola/Git/ps-dare-paper/auto_arima_example.csv
 ```
 
-From the orders file, run the predict-arima
+Run order selection, model calibration/persistence, and rolling testing as one
+pipeline for one or more configuration files:
+
+```bash
+python -m src.ps_dare.arima_pipeline --jobs 6 auto_arima_example_def_1.csv auto_arima_example_def_2.csv auto_arima_example_def_3.csv
+```
+
+The installed equivalent is `ps-dare-arima-pipeline`. Configurations are
+processed in the order supplied. For each one, testing starts automatically as
+soon as its Auto-ARIMA order table has been saved. Rows whose `driver_kind` is
+`forced` retain their explicitly defined order; all other eligible rows use
+Auto-ARIMA. `--jobs` controls how many independent rows/models are processed
+concurrently; omit it for deterministic single-process execution.
+
+Alternatively, from an existing orders file, run predict-arima directly.
 
 
 Run rolling one-step-ahead predictions from a model-order table:
 
 ```bash
-python -m ps_dare.predict_arima data/weekly/orders/orders_YYYYMMDD_HHMMSS.csv
+python -m src.ps_dare.predict_arima data/weekly/orders/orders.csv
 ```
 
 Each saved model is calibrated once on its configured training period. After
 each prediction, the observed access count is passed to the model's `update`
-method before predicting the next period. The combined long-form output keeps
+method before predicting the next period. Each model's long-form output keeps
 the complete access series, the selected driver and its value when applicable,
 and predictions with their 95% confidence interval lower and upper bounds for
-the configured testing window. It is written to
-`data/<weekly|monthly>/predictions/`, with one CSV named after each distinct
-training file and suffixed with the timestamp from the input orders file (for
-example, `general_YYYYMMDD_HHMMSS.csv`). Multiple driver models for the same
-training file remain in the same output and are distinguished by `model_id`.
+the configured testing window. A completed simulation is immediately written
+to its own file at
+`data/<weekly|monthly>/predictions/<dataset>/<model_id>_<timestamp>.csv`.
+Completed simulation DataFrames are never retained while other models finish,
+so an interrupted batch preserves every finished result file.
+
+The prediction output also stores `training_aic` and `fitted_parameters`. These
+are captured immediately after the initial training fit, before rolling test
+observations update the model. `fitted_parameters` is a JSON object mapping
+coefficient names to values. To calculate out-of-sample MAPE, use only rows
+whose `phase` is `testing`, comparing `n_accesses` with `prediction`; define a
+policy for zero observed values because ordinary percentage error is undefined
+there.
+
+Every initial training fit is also serialized before testing as a pickle file:
+`data/<weekly|monthly>/models/<dataset>/<model_id>_<timestamp>.pkl`. The dataset
+directory, model ID (including the driver), row number, and orders-file
+timestamp uniquely identify the fitted model. The prediction CSV's
+`model_file` column records the corresponding path. Only load pickle files
+produced by a trusted source, because unpickling can execute arbitrary code.
 
 For models with an exogenous driver, testing stops before the first period
 whose required lagged driver value is unavailable. That period and every later

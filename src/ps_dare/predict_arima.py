@@ -14,8 +14,11 @@ From the repository root, run::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import pickle
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -218,10 +221,75 @@ def _model_id(row_number: int, path: Path, driver: str | None) -> str:
     return f"model_{row_number + 1:03d}_{slug}"
 
 
+def _training_fit_statistics(model: Any) -> tuple[float, str]:
+    """Extract AIC and named coefficients before rolling updates modify the fit."""
+    try:
+        aic = float(model.aic())
+    except (AttributeError, TypeError, ValueError):
+        aic = float("nan")
+
+    result = getattr(model, "arima_res_", None)
+    names = list(getattr(result, "param_names", []))
+    try:
+        values = list(model.params())
+    except (AttributeError, TypeError, ValueError):
+        values = list(getattr(result, "params", []))
+
+    if not names and values:
+        names = [f"parameter_{number + 1}" for number in range(len(values))]
+    parameters = {
+        str(name): float(value) for name, value in zip(names, values, strict=False)
+    }
+    return aic, json.dumps(parameters, sort_keys=True)
+
+
+def _save_fitted_model(model: Any, output: Path) -> None:
+    """Serialize the initial training fit before any test-period updates."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("wb") as stream:
+        pickle.dump(model, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    LOGGER.info("Saved fitted model to %s", output)
+
+
+def _model_output_path(
+    row: pd.Series, row_number: int, timestamp: str
+) -> Path:
+    """Return a unique, dataset-specific path for one fitted model."""
+    frequency = _frequency(row["aggregation"])
+    discretization = _discretization(row["discretization"])
+    dataset = _dataset_path(row, frequency, discretization)
+    model_id = _model_id(row_number, dataset, _driver_name(row))
+    return solve_path(
+        Path("data")
+        / frequency
+        / "models"
+        / dataset.stem
+        / f"{model_id}_{timestamp}.pkl"
+    )
+
+
+def _prediction_output_path(
+    row: pd.Series, row_number: int, timestamp: str
+) -> Path:
+    """Return a unique per-model path for one completed test simulation."""
+    frequency = _frequency(row["aggregation"])
+    discretization = _discretization(row["discretization"])
+    dataset = _dataset_path(row, frequency, discretization)
+    model_id = _model_id(row_number, dataset, _driver_name(row))
+    return solve_path(
+        Path("data")
+        / frequency
+        / "predictions"
+        / dataset.stem
+        / f"{model_id}_{timestamp}.csv"
+    )
+
+
 def forecast_order(
     row: pd.Series,
     row_number: int = 0,
     model_class: Any | None = None,
+    model_output_path: Path | None = None,
 ) -> pd.DataFrame:
     """Fit one saved model and return its full input series and predictions."""
     if model_class is None:
@@ -286,6 +354,9 @@ def forecast_order(
         with_intercept=_boolean(row["intercept"]),
         suppress_warnings=True,
     ).fit(y_training, X=X_training)
+    training_aic, fitted_parameters = _training_fit_statistics(model)
+    if model_output_path is not None:
+        _save_fitted_model(model, model_output_path)
 
     LOGGER.info(
         "Fitted %s on %s observations; forecasting %s one-step periods",
@@ -362,6 +433,9 @@ def forecast_order(
             "Q": seasonal_order[2],
             "seasonal_period": seasonal_order[3],
             "intercept": _boolean(row["intercept"]),
+            "training_aic": training_aic,
+            "fitted_parameters": fitted_parameters,
+            "model_file": "" if model_output_path is None else str(model_output_path),
         }
     )
     result.index = pd.RangeIndex(len(result))
@@ -388,27 +462,74 @@ def save_predictions(predictions: pd.DataFrame, timestamp: str) -> list[Path]:
     return outputs
 
 
-def run(orders_path: str | Path) -> list[Path]:
-    """Forecast every order row and save one result per training file."""
+def _save_model_prediction(prediction: pd.DataFrame, output: Path) -> Path:
+    """Persist one completed model simulation immediately."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    prediction.to_csv(output, index=False, date_format="%Y-%m-%d")
+    LOGGER.info("Saved completed model simulation to %s", output)
+    return output
+
+
+def _forecast_order_isolated(
+    task: tuple[pd.Series, int, Path, Path],
+) -> Path:
+    """Fit, persist, test, and immediately save one order-table row."""
+    row, row_number, model_output_path, prediction_output_path = task
+    prediction = forecast_order(
+        row, row_number, model_output_path=model_output_path
+    )
+    return _save_model_prediction(prediction, prediction_output_path)
+
+
+def run(orders_path: str | Path, jobs: int = 1) -> list[Path]:
+    """Forecast every order row and immediately save one file per model."""
+    if jobs < 1:
+        raise ValueError("jobs must be at least 1")
     resolved_orders = solve_path(orders_path)
     timestamp = orders_timestamp(resolved_orders)
     orders = read_orders(resolved_orders)
-    forecasts = pd.concat(
-        [
-            forecast_order(row, row_number)
-            for row_number, (_, row) in enumerate(orders.iterrows())
-        ],
-        ignore_index=True,
-    )
-    return save_predictions(forecasts, timestamp)
+    tasks = []
+    for fallback_number, (_, row) in enumerate(orders.iterrows()):
+        saved_number = row.get("model_number")
+        row_number = (
+            fallback_number
+            if saved_number is None or pd.isna(saved_number)
+            else _integer(saved_number, "model_number") - 1
+        )
+        tasks.append(
+            (
+                row,
+                row_number,
+                _model_output_path(row, row_number, timestamp),
+                _prediction_output_path(row, row_number, timestamp),
+            )
+        )
+    if jobs == 1:
+        return [_forecast_order_isolated(task) for task in tasks]
+
+    LOGGER.info("Calibrating and testing models with %s worker processes", jobs)
+    outputs: list[Path] = []
+    with ProcessPoolExecutor(max_workers=jobs) as executor:
+        futures = [executor.submit(_forecast_order_isolated, task) for task in tasks]
+        for future in as_completed(futures):
+            # The worker writes before returning, so completed DataFrames never
+            # accumulate in the parent process while other simulations finish.
+            outputs.append(future.result())
+    return outputs
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("orders", help="orders.csv produced by ps_dare.auto_arima")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="models to calibrate and test concurrently (default: %(default)s)",
+    )
     args = parser.parse_args()
-    for output in run(args.orders):
+    for output in run(args.orders, jobs=args.jobs):
         print(f"Saved {output}")
 
 

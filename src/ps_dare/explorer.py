@@ -212,14 +212,14 @@ def draw_timeseries(
             color="black" if case_is_affected else "grey",
             linestyle="--",
             linewidth=0.9 if case_is_affected else 0.5,
-            alpha=0.8 if case_is_affected else 0.2,
+            alpha=1.0 if case_is_affected else 0.2,
         )
         drivers_axis.axvline(
             date,
             color="black" if driver_is_affected else "grey",
             linestyle="--",
             linewidth=0.9 if driver_is_affected else 0.5,
-            alpha=0.8 if driver_is_affected else 0.2,
+            alpha=1.0 if driver_is_affected else 0.2,
             label="Missing data" if index == 0 else None,
         )
     drivers_axis.set_ylabel("Driver value")

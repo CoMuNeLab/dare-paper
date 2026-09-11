@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 ps-dare-explorer = "ps_dare.explorer:main"
 ps-dare-predict = "ps_dare.predict_arima:main"
+ps-dare-arima-pipeline = "ps_dare.arima_pipeline:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
