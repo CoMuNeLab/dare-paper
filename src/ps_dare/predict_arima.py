@@ -1,14 +1,16 @@
 """Run rolling one-step-ahead forecasts from an ``orders.csv`` file.
 
-The order table is the complete forecasting specification: it identifies the
-dataset, training and testing limits, exogenous driver, lag, ARIMA orders, and
-intercept choice.  Each model is fitted once on its configured training
-window.  After every one-step-ahead prediction, ``pmdarima.ARIMA.update`` adds
-the newly observed access count before the next prediction is made.
+The order table identifies the fitted model produced by ``auto_arima`` along
+with the dataset, testing limits, exogenous driver, lag, and ARIMA orders.
+Prediction loads that exact training fit. After every one-step-ahead
+prediction, the newly observed access count is added before the next forecast.
+By default this uses ``pmdarima.ARIMA.update``; optional CLI modes can append
+state without refitting or limit the update's MLE iterations.
 
 From the repository root, run::
 
-    python -m ps_dare.predict_arima data/weekly/orders/orders_20240101_120000.csv
+    python -m ps_dare.predict_arima \
+        --orders data/orders/20240101_120000/orders_20240101_120000.csv
 """
 
 from __future__ import annotations
@@ -16,9 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
 import pickle
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +41,7 @@ from .paths import solve_path
 LOGGER = logging.getLogger(__name__)
 
 CONFIDENCE_ALPHA = 0.05
+HOSPITAL_NAMES = ("giustiniani", "osa", "pediatrico")
 
 REQUIRED_ORDER_COLUMNS = {
     "aggregation",
@@ -56,6 +60,7 @@ REQUIRED_ORDER_COLUMNS = {
     "Q",
     "seasonal_period",
     "intercept",
+    "model_file",
 }
 
 ORDERS_FILENAME_PATTERN = re.compile(r"orders_(\d{8}_\d{6})\.csv")
@@ -221,6 +226,19 @@ def _model_id(row_number: int, path: Path, driver: str | None) -> str:
     return f"model_{row_number + 1:03d}_{slug}"
 
 
+def _prediction_file_id(
+    row_number: int,
+    path: Path,
+    driver: str | None,
+    aggregation: str,
+    lag: object,
+) -> str:
+    """Include aggregation and lag before the progressive model label."""
+    label = f"{path.stem}_{driver or 'none'}_{aggregation}_lag_{lag}"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", label).strip("_").lower()
+    return f"{slug}_model_{row_number + 1:03d}"
+
+
 def _training_fit_statistics(model: Any) -> tuple[float, str]:
     """Extract AIC and named coefficients before rolling updates modify the fit."""
     try:
@@ -251,10 +269,111 @@ def _save_fitted_model(model: Any, output: Path) -> None:
     LOGGER.info("Saved fitted model to %s", output)
 
 
+def _load_fitted_model(path: Path) -> Any:
+    """Load the exact training fit saved by the order-selection stage."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Fitted model not found: {path}")
+    with path.open("rb") as stream:
+        model = pickle.load(stream)
+    LOGGER.info("Loaded fitted Auto-ARIMA model from %s", path)
+    return model
+
+
+def _validate_update_options(
+    state_only_updates: bool, update_maxiter: int | None
+) -> None:
+    """Validate the mutually exclusive rolling-update strategies."""
+    if state_only_updates and update_maxiter is not None:
+        raise ValueError(
+            "state_only_updates and update_maxiter cannot be used together"
+        )
+    if update_maxiter is not None and update_maxiter < 1:
+        raise ValueError("update_maxiter must be at least 1")
+
+
+def _update_model(
+    model: Any,
+    actual: float,
+    date: pd.Timestamp,
+    X_step: pd.DataFrame | None,
+    *,
+    state_only_updates: bool,
+    update_maxiter: int | None,
+) -> None:
+    """Append one observation, optionally avoiding or limiting MLE fitting."""
+    if state_only_updates:
+        results = getattr(model, "arima_res_", None)
+        append = getattr(results, "append", None)
+        if not callable(append):
+            raise TypeError(
+                "The fitted model does not support state-only append updates"
+            )
+        model_data = getattr(getattr(results, "model", None), "data", None)
+        original_endog = getattr(model_data, "orig_endog", None)
+        observation_index = pd.DatetimeIndex([date])
+        if isinstance(original_endog, pd.DataFrame):
+            observation = pd.DataFrame(
+                [[float(actual)]],
+                index=observation_index,
+                columns=original_endog.columns,
+            )
+        elif isinstance(original_endog, pd.Series):
+            observation = pd.Series(
+                [float(actual)],
+                index=observation_index,
+                name=original_endog.name,
+            )
+        else:
+            observation = [float(actual)]
+
+        original_exog = getattr(model_data, "orig_exog", None)
+        if X_step is None:
+            appended_X = None
+        elif isinstance(original_exog, pd.DataFrame):
+            appended_X = X_step.copy()
+            if len(appended_X.columns) != len(original_exog.columns):
+                raise ValueError(
+                    "State-only update exogenous columns do not match the fitted model"
+                )
+            appended_X.columns = original_exog.columns
+        elif isinstance(original_exog, pd.Series):
+            if X_step.shape[1] != 1:
+                raise ValueError(
+                    "State-only update expected one exogenous model column"
+                )
+            appended_X = X_step.iloc[:, 0].rename(original_exog.name)
+        else:
+            appended_X = X_step.to_numpy()
+
+        model.arima_res_ = append(
+            observation,
+            exog=appended_X,
+            refit=False,
+        )
+        if hasattr(model, "nobs_"):
+            model.nobs_ = model.arima_res_.nobs
+        return
+
+    if update_maxiter is None:
+        # Preserve pmdarima's existing default behavior exactly.
+        model.update([float(actual)], X=X_step)
+    else:
+        model.update([float(actual)], X=X_step, maxiter=update_maxiter)
+
+
 def _model_output_path(
     row: pd.Series, row_number: int, timestamp: str
 ) -> Path:
-    """Return a unique, dataset-specific path for one fitted model."""
+    """Resolve the saved fit, with a legacy generated-path fallback."""
+    saved_model = row.get("model_file")
+    if (
+        saved_model is not None
+        and not pd.isna(saved_model)
+        and str(saved_model).strip()
+    ):
+        configured = Path(str(saved_model).strip()).expanduser()
+        return configured if configured.is_absolute() else solve_path(configured)
+
     frequency = _frequency(row["aggregation"])
     discretization = _discretization(row["discretization"])
     dataset = _dataset_path(row, frequency, discretization)
@@ -275,14 +394,60 @@ def _prediction_output_path(
     frequency = _frequency(row["aggregation"])
     discretization = _discretization(row["discretization"])
     dataset = _dataset_path(row, frequency, discretization)
-    model_id = _model_id(row_number, dataset, _driver_name(row))
+    prediction_file_id = _prediction_file_id(
+        row_number,
+        dataset,
+        _driver_name(row),
+        frequency,
+        row["lag"],
+    )
     return solve_path(
         Path("data")
         / frequency
         / "predictions"
         / dataset.stem
-        / f"{model_id}_{timestamp}.csv"
+        / f"{prediction_file_id}_{timestamp}.csv"
     )
+
+
+def _metrics_output_path(prediction_output: Path) -> Path:
+    """Mirror a prediction path under the frequency's ``metrics`` folder."""
+    predictions_directory = prediction_output.parent
+    while (
+        predictions_directory.name != "predictions"
+        and predictions_directory != predictions_directory.parent
+    ):
+        predictions_directory = predictions_directory.parent
+    if predictions_directory.name != "predictions":
+        raise ValueError(
+            f"Prediction output is not below a predictions folder: {prediction_output}"
+        )
+    relative_output = prediction_output.relative_to(predictions_directory)
+    return predictions_directory.parent / "metrics" / relative_output
+
+
+def _dataset_metadata(path: str | Path) -> dict[str, object]:
+    """Extract hospital and subset metadata from an assembled dataset name."""
+    dataset_name = Path(path).stem
+    categorized = dataset_name.endswith("_cat")
+    base_name = dataset_name.removesuffix("_cat")
+    hospital = next(
+        (
+            name
+            for name in HOSPITAL_NAMES
+            if base_name == name or base_name.endswith(f"_{name}")
+        ),
+        "",
+    )
+    subset = (
+        base_name.removesuffix(f"_{hospital}") if hospital else base_name
+    )
+    return {
+        "dataset_name": dataset_name,
+        "hospital": hospital,
+        "subset": subset,
+        "categorized_dataset": categorized,
+    }
 
 
 def forecast_order(
@@ -290,12 +455,12 @@ def forecast_order(
     row_number: int = 0,
     model_class: Any | None = None,
     model_output_path: Path | None = None,
+    *,
+    state_only_updates: bool = False,
+    update_maxiter: int | None = None,
 ) -> pd.DataFrame:
-    """Fit one saved model and return its full input series and predictions."""
-    if model_class is None:
-        from pmdarima import ARIMA
-
-        model_class = ARIMA
+    """Load one saved fit and return its full input series and predictions."""
+    _validate_update_options(state_only_updates, update_maxiter)
 
     frequency = _frequency(row["aggregation"])
     discretization = _discretization(row["discretization"])
@@ -348,21 +513,48 @@ def forecast_order(
     seasonal_order = tuple(
         _integer(row[name], name) for name in ("P", "D", "Q", "seasonal_period")
     )
-    model = model_class(
-        order=order,
-        seasonal_order=seasonal_order,
-        with_intercept=_boolean(row["intercept"]),
-        suppress_warnings=True,
-    ).fit(y_training, X=X_training)
+    if model_class is None:
+        if model_output_path is None:
+            saved_model = row.get("model_file")
+            if (
+                saved_model is None
+                or pd.isna(saved_model)
+                or not str(saved_model).strip()
+            ):
+                raise ValueError("Order row does not identify a fitted model file")
+            model_output_path = _model_output_path(row, row_number, "")
+        model = _load_fitted_model(model_output_path)
+        if tuple(model.order) != order or tuple(model.seasonal_order) != seasonal_order:
+            raise ValueError(
+                f"{model_output_path}: fitted model orders do not match its order table"
+            )
+    else:
+        # Explicit model classes remain available for isolated tests and callers
+        # constructing a model without an Auto-ARIMA artifact.
+        model = model_class(
+            order=order,
+            seasonal_order=seasonal_order,
+            with_intercept=_boolean(row["intercept"]),
+            suppress_warnings=True,
+        ).fit(y_training, X=X_training)
+        if model_output_path is not None:
+            _save_fitted_model(model, model_output_path)
+
     training_aic, fitted_parameters = _training_fit_statistics(model)
-    if model_output_path is not None:
-        _save_fitted_model(model, model_output_path)
 
     LOGGER.info(
-        "Fitted %s on %s observations; forecasting %s one-step periods",
+        "Using %s trained on %s observations; forecasting %s one-step periods "
+        "with %s updates",
         _model_id(row_number, path, driver),
         len(y_training),
         len(y_testing),
+        (
+            "state-only"
+            if state_only_updates
+            else "pmdarima default"
+            if update_maxiter is None
+            else f"pmdarima maxiter={update_maxiter}"
+        ),
     )
     predictions = pd.Series(index=data.index, dtype="float64", name="prediction")
     prediction_lower_bound = pd.Series(
@@ -388,7 +580,14 @@ def forecast_order(
             )
         prediction_lower_bound.loc[date] = float(interval.iloc[0, 0])
         prediction_upper_bound.loc[date] = float(interval.iloc[0, 1])
-        model.update([float(actual)], X=X_step)
+        _update_model(
+            model,
+            float(actual),
+            pd.Timestamp(date),
+            X_step,
+            state_only_updates=state_only_updates,
+            update_maxiter=update_maxiter,
+        )
 
     phase = pd.Series("before_training", index=data.index, dtype="object")
     phase.loc[
@@ -408,10 +607,12 @@ def forecast_order(
     result = pd.DataFrame(
         {
             "model_id": _model_id(row_number, path, driver),
+            "model_number": row_number + 1,
             "aggregation": frequency,
             "discretization": discretization,
             "path_to_training_file": str(path),
             "category": category,
+            "driver_kind": str(row.get("driver_kind", "")),
             "date_start_training": training_start.date().isoformat(),
             "date_end_training": training_end.date().isoformat(),
             "date_end_testing": testing_end.date().isoformat(),
@@ -422,6 +623,15 @@ def forecast_order(
             "driver_value": driver_values,
             "lag": str(row["lag"]),
             "prediction_horizon": 1,
+            "confidence_alpha": CONFIDENCE_ALPHA,
+            "update_mode": (
+                "state_only"
+                if state_only_updates
+                else "pmdarima_default"
+                if update_maxiter is None
+                else "pmdarima_limited"
+            ),
+            "update_maxiter": update_maxiter,
             "prediction": predictions,
             "prediction_lower_bound": prediction_lower_bound,
             "prediction_upper_bound": prediction_upper_bound,
@@ -440,6 +650,99 @@ def forecast_order(
     )
     result.index = pd.RangeIndex(len(result))
     return result
+
+
+def _constant_value(
+    predictions: pd.DataFrame, column: str, default: object = ""
+) -> object:
+    """Return a model-level value repeated across a prediction artifact."""
+    if column not in predictions or predictions.empty:
+        return default
+    value = predictions[column].iloc[0]
+    return default if pd.isna(value) else value
+
+
+def model_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Build one metadata and evaluation row for a completed model."""
+    training_file = str(_constant_value(predictions, "path_to_training_file"))
+    metadata = _dataset_metadata(training_file)
+    testing = predictions.loc[predictions["phase"].eq("testing")].copy()
+    actual = pd.to_numeric(testing[CASE_COLUMN], errors="coerce")
+    forecast = pd.to_numeric(testing["prediction"], errors="coerce")
+    scored = actual.notna() & forecast.notna()
+    actual = actual.loc[scored]
+    forecast = forecast.loc[scored]
+    absolute_errors = (actual - forecast).abs()
+    nonzero = actual.ne(0)
+
+    mean_absolute_error = (
+        float(absolute_errors.mean()) if not absolute_errors.empty else float("nan")
+    )
+    total_absolute_error = (
+        float(absolute_errors.sum()) if not absolute_errors.empty else float("nan")
+    )
+    mape = (
+        float((absolute_errors.loc[nonzero] / actual.loc[nonzero].abs()).mean() * 100)
+        if nonzero.any()
+        else float("nan")
+    )
+    testing_dates = (
+        pd.to_datetime(testing["date"], errors="coerce").dropna()
+        if "date" in testing
+        else pd.Series(dtype="datetime64[ns]")
+    )
+
+    row = {
+        "model_id": _constant_value(predictions, "model_id"),
+        "model_number": _constant_value(predictions, "model_number"),
+        **metadata,
+        "path_to_training_file": training_file,
+        "temporal_aggregation": _constant_value(predictions, "aggregation"),
+        "driver_kind": _constant_value(predictions, "driver_kind"),
+        "driver": _constant_value(predictions, "drivers_used"),
+        "lag": _constant_value(predictions, "lag"),
+        "discretization": _constant_value(predictions, "discretization"),
+        "category": _constant_value(predictions, "category"),
+        "training_start": _constant_value(predictions, "date_start_training"),
+        "training_end": _constant_value(predictions, "date_end_training"),
+        "testing_start": (
+            "" if testing_dates.empty else testing_dates.min().date().isoformat()
+        ),
+        "testing_end": _constant_value(predictions, "date_end_testing"),
+        "training_observations": int(predictions["phase"].eq("training").sum()),
+        "testing_observations": int(len(testing)),
+        "scored_predictions": int(scored.sum()),
+        "p": _constant_value(predictions, "p"),
+        "d": _constant_value(predictions, "d"),
+        "q": _constant_value(predictions, "q"),
+        "P": _constant_value(predictions, "P"),
+        "D": _constant_value(predictions, "D"),
+        "Q": _constant_value(predictions, "Q"),
+        "seasonal_period": _constant_value(predictions, "seasonal_period"),
+        "intercept": _constant_value(predictions, "intercept"),
+        "update_mode": _constant_value(predictions, "update_mode"),
+        "update_maxiter": _constant_value(predictions, "update_maxiter"),
+        "prediction_horizon": _constant_value(predictions, "prediction_horizon"),
+        "confidence_alpha": _constant_value(predictions, "confidence_alpha"),
+        "model_file": _constant_value(predictions, "model_file"),
+        "fitted_parameters": _constant_value(predictions, "fitted_parameters"),
+        "aic": _constant_value(predictions, "training_aic", float("nan")),
+        # ``ae`` is the mean absolute error so models with different testing
+        # lengths remain directly comparable. The total is retained separately.
+        "ae": mean_absolute_error,
+        "total_absolute_error": total_absolute_error,
+        "mape": mape,
+        "mape_zero_actuals_excluded": int((~nonzero).sum()),
+    }
+    return pd.DataFrame([row])
+
+
+def save_model_metrics(predictions: pd.DataFrame, output: Path) -> Path:
+    """Save one model's metadata, AIC, AE, and MAPE immediately."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    model_metrics(predictions).to_csv(output, index=False)
+    LOGGER.info("Saved completed model metrics to %s", output)
+    return output
 
 
 def save_predictions(predictions: pd.DataFrame, timestamp: str) -> list[Path]:
@@ -471,20 +774,42 @@ def _save_model_prediction(prediction: pd.DataFrame, output: Path) -> Path:
 
 
 def _forecast_order_isolated(
-    task: tuple[pd.Series, int, Path, Path],
-) -> Path:
-    """Fit, persist, test, and immediately save one order-table row."""
-    row, row_number, model_output_path, prediction_output_path = task
+    task: tuple[pd.Series, int, Path, Path, bool, int | None],
+) -> list[Path]:
+    """Load, test, and immediately save predictions plus model metrics."""
+    (
+        row,
+        row_number,
+        model_output_path,
+        prediction_output_path,
+        state_only_updates,
+        update_maxiter,
+    ) = task
     prediction = forecast_order(
-        row, row_number, model_output_path=model_output_path
+        row,
+        row_number,
+        model_output_path=model_output_path,
+        state_only_updates=state_only_updates,
+        update_maxiter=update_maxiter,
     )
-    return _save_model_prediction(prediction, prediction_output_path)
+    saved_prediction = _save_model_prediction(prediction, prediction_output_path)
+    saved_metrics = save_model_metrics(
+        prediction, _metrics_output_path(prediction_output_path)
+    )
+    return [saved_prediction, saved_metrics]
 
 
-def run(orders_path: str | Path, jobs: int = 1) -> list[Path]:
+def run(
+    orders_path: str | Path,
+    jobs: int = 1,
+    *,
+    state_only_updates: bool = False,
+    update_maxiter: int | None = None,
+) -> list[Path]:
     """Forecast every order row and immediately save one file per model."""
     if jobs < 1:
         raise ValueError("jobs must be at least 1")
+    _validate_update_options(state_only_updates, update_maxiter)
     resolved_orders = solve_path(orders_path)
     timestamp = orders_timestamp(resolved_orders)
     orders = read_orders(resolved_orders)
@@ -502,34 +827,91 @@ def run(orders_path: str | Path, jobs: int = 1) -> list[Path]:
                 row_number,
                 _model_output_path(row, row_number, timestamp),
                 _prediction_output_path(row, row_number, timestamp),
+                state_only_updates,
+                update_maxiter,
             )
         )
     if jobs == 1:
-        return [_forecast_order_isolated(task) for task in tasks]
+        outputs: list[Path] = []
+        for task in tasks:
+            outputs.extend(_forecast_order_isolated(task))
+        return outputs
 
-    LOGGER.info("Calibrating and testing models with %s worker processes", jobs)
+    LOGGER.info("Testing models with %s worker processes", jobs)
     outputs: list[Path] = []
-    with ProcessPoolExecutor(max_workers=jobs) as executor:
-        futures = [executor.submit(_forecast_order_isolated, task) for task in tasks]
-        for future in as_completed(futures):
-            # The worker writes before returning, so completed DataFrames never
-            # accumulate in the parent process while other simulations finish.
-            outputs.append(future.result())
+    with ProcessPoolExecutor(
+        max_workers=jobs,
+        max_tasks_per_child=1,
+        mp_context=multiprocessing.get_context("spawn"),
+    ) as executor:
+        task_iterator = iter(tasks)
+        pending = {
+            executor.submit(_forecast_order_isolated, task)
+            for task in (next(task_iterator, None) for _ in range(jobs))
+            if task is not None
+        }
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                # Each fresh worker saves predictions and metrics before exit,
+                # returning native-library memory to the operating system.
+                outputs.extend(future.result())
+                next_task = next(task_iterator, None)
+                if next_task is not None:
+                    pending.add(
+                        executor.submit(_forecast_order_isolated, next_task)
+                    )
     return outputs
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("orders", help="orders.csv produced by ps_dare.auto_arima")
+    parser.add_argument(
+        "orders_path",
+        nargs="?",
+        help="orders manifest produced by ps_dare.auto_arima (legacy positional form)",
+    )
+    parser.add_argument(
+        "--orders",
+        dest="orders_option",
+        metavar="PATH",
+        help="orders manifest produced by ps_dare.auto_arima",
+    )
     parser.add_argument(
         "--jobs",
         type=int,
         default=1,
-        help="models to calibrate and test concurrently (default: %(default)s)",
+        help="models to test concurrently (default: %(default)s)",
+    )
+    update_group = parser.add_mutually_exclusive_group()
+    update_group.add_argument(
+        "--state-only-updates",
+        action="store_true",
+        help="append observations without recalibrating model coefficients",
+    )
+    update_group.add_argument(
+        "--update-maxiter",
+        type=int,
+        metavar="N",
+        help="limit each pmdarima coefficient update to N MLE iterations",
     )
     args = parser.parse_args()
-    for output in run(args.orders, jobs=args.jobs):
+    if args.orders_path and args.orders_option:
+        parser.error(
+            "specify the orders file either positionally or with --orders, not both"
+        )
+    orders_path = args.orders_option or args.orders_path
+    if orders_path is None:
+        parser.error("an orders manifest is required; pass --orders PATH")
+    if args.update_maxiter is not None and args.update_maxiter < 1:
+        parser.error("--update-maxiter must be at least 1")
+    for output in run(
+        orders_path,
+        jobs=args.jobs,
+        state_only_updates=args.state_only_updates,
+        update_maxiter=args.update_maxiter,
+    ):
         print(f"Saved {output}")
 
 

@@ -4,23 +4,32 @@ Run this module from the repository root with::
 
     python -m ps_dare.auto_arima path/to/datasets.csv
 
+In addition to the per-model order artifacts, the standalone command writes a
+combined ``orders_YYYYMMDD_HHMMSS.csv`` manifest below ``data/orders``. Pass
+that manifest to ``ps_dare.predict_arima --orders`` to test all saved models.
+
 The configuration accepts the following columns (spaces may be used instead of
 underscores): ``dataset``, ``aggregation``, ``driver_kind``,
 ``discretization``, ``train_start``, ``train_end``, ``test_end``, and ``lag``.
 ``test_end`` is retained in the output but is not used yet.  ``forced`` uses
 the predefined model ``(1, 1, 1)(2, 0, 0)[m]`` without exogenous drivers.
 Datasets are fitted only when every training timestep has more than the
-configured weekly or monthly case threshold.  Rejected datasets are recorded
-in ``data/<weekly|monthly>/orders/skipped.csv`` instead of an order table.
+configured weekly or monthly case threshold. Each completed fit is serialized
+and its path is recorded in the corresponding order table. Rejected datasets
+are recorded in ``data/<weekly|monthly>/orders/skipped.csv`` instead.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing
+import pickle
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from logging.handlers import QueueHandler
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -31,7 +40,7 @@ LOGGER = logging.getLogger(__name__)
 
 CASE_COLUMN = "n_accesses"
 # Every training timestep must be strictly above its aggregation's threshold.
-MIN_CASES_PER_TIMESTEP = {"weekly": 1, "monthly": 10}
+MIN_CASES_PER_TIMESTEP = {"weekly": -1, "monthly": -10}
 FREQUENCIES = {
     "week": "weekly",
     "weekly": "weekly",
@@ -40,13 +49,14 @@ FREQUENCIES = {
     "monthly": "monthly",
 }
 SEASONAL_PERIODS = {"weekly": 52, "monthly": 12}
-DRIVER_KINDS = {"pollution", "weather", "none", "forced"}
+DRIVER_KINDS = {"pollution", "weather", "none", "forced", "baseline"}
 DISCRETIZATIONS = {"discrete", "continuous"}
 SELECTED_DRIVER_COLUMN = "_selected_driver"
 MODEL_NUMBER_COLUMN = "model_number"
 FORCED_ORDER = (1, 1, 1)
 FORCED_SEASONAL_ORDER = (2, 0, 0)
 FORCED_INTERCEPT = True
+ORDERS_FILENAME_PATTERN = re.compile(r"orders_(\d{8}_\d{6})\.csv")
 
 # Only drivers listed here are calibrated.  Each available driver produces a
 # separate model; it is never combined with another driver from the list.
@@ -113,6 +123,13 @@ COLUMN_ALIASES = {
     "lag": ("lag", "driver_lag", "lag_of_drivers"),
     "category": ("category", "diagnosis_category"),
 }
+
+
+def _configure_worker_logging(log_queue: Any) -> None:
+    """Forward worker-process records to the pipeline's logging handlers."""
+    root_logger = logging.getLogger()
+    root_logger.handlers = [QueueHandler(log_queue)]
+    root_logger.setLevel(logging.INFO)
 
 
 def _column_name(value: object) -> str:
@@ -194,7 +211,7 @@ def load_training_file(path: Path) -> pd.DataFrame:
 def select_drivers(frame: pd.DataFrame, kind: str) -> list[str]:
     """Select available exogenous columns from the configured driver lists."""
     available = driver_columns(frame)
-    if kind in {"none", "forced"}:
+    if kind in {"none", "forced", "baseline"}:
         return []
     return [column for column in DRIVERS_BY_KIND[kind] if column in available]
 
@@ -264,11 +281,16 @@ def checked_driver_data(
 def analyze_dataset(
     row: pd.Series,
     skipped: list[dict[str, object]] | None = None,
+    fitted_models: list[Any] | None = None,
 ) -> list[dict[str, object]]:
     """Fit the models requested by one eligible configuration row."""
     frequency = _frequency(row["aggregation"])
     discretization = _discretization(row["discretization"])
     kind = _driver_kind(row["driver_kind"])
+    if kind == "baseline":
+        raise ValueError(
+            "baseline does not fit an ARIMA model; run it through arima_pipeline"
+        )
     path = _dataset_path(row["dataset"], frequency, discretization)
     LOGGER.info("Loading dataset %s", path)
     frame = load_training_file(path)
@@ -422,6 +444,8 @@ def analyze_dataset(
         if MODEL_NUMBER_COLUMN in row:
             result[MODEL_NUMBER_COLUMN] = int(row[MODEL_NUMBER_COLUMN])
         results.append(result)
+        if fitted_models is not None:
+            fitted_models.append(model)
     return results
 
 
@@ -450,7 +474,7 @@ def _expanded_model_rows(
         case_threshold = MIN_CASES_PER_TIMESTEP[frequency]
         below_threshold = y.le(case_threshold)
 
-        if y.empty or below_threshold.any():
+        if kind != "baseline" and (y.empty or below_threshold.any()):
             skipped_records.append(
                 {
                     "dataset": str(row["dataset"]),
@@ -500,8 +524,30 @@ def _model_slug(record: dict[str, object]) -> str:
     return f"model_{int(record[MODEL_NUMBER_COLUMN]):03d}_{label}"
 
 
-def _save_model_order(record: dict[str, object], timestamp: str) -> Path:
-    """Immediately save one completed order search to its own CSV."""
+def _model_output_path(record: dict[str, object], timestamp: str) -> Path:
+    """Return the path for the fitted model associated with an order record."""
+    dataset = Path(str(record["path_to_training_file"])).stem
+    return solve_path(
+        Path("data")
+        / str(record["aggregation"])
+        / "models"
+        / dataset
+        / f"{_model_slug(record)}_{timestamp}.pkl"
+    )
+
+
+def _save_model_order(
+    record: dict[str, object], timestamp: str, fitted_model: Any
+) -> Path:
+    """Immediately save one fitted model and its one-row order table."""
+    record = record.copy()
+    model_output = _model_output_path(record, timestamp)
+    model_output.parent.mkdir(parents=True, exist_ok=True)
+    with model_output.open("wb") as stream:
+        pickle.dump(fitted_model, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    record["model_file"] = str(model_output)
+    LOGGER.info("Saved fitted Auto-ARIMA model to %s", model_output)
+
     output = solve_path(
         Path("data")
         / str(record["aggregation"])
@@ -517,15 +563,24 @@ def _save_model_order(record: dict[str, object], timestamp: str) -> Path:
 
 
 def _analyze_and_save_model(task: tuple[pd.Series, str]) -> Path:
-    """Select and persist exactly one model without returning fitted state."""
+    """Select and immediately persist exactly one fitted model and its orders."""
     row, timestamp = task
-    results = analyze_dataset(row)
-    if len(results) != 1:
-        raise RuntimeError(f"Expected exactly one model result, got {len(results)}")
-    return _save_model_order(results[0], timestamp)
+    fitted_models: list[Any] = []
+    results = analyze_dataset(row, fitted_models=fitted_models)
+    if len(results) != 1 or len(fitted_models) != 1:
+        raise RuntimeError(
+            "Expected exactly one model result and fitted model, got "
+            f"{len(results)} and {len(fitted_models)}"
+        )
+    return _save_model_order(results[0], timestamp, fitted_models[0])
 
 
-def iter_run(configuration_path: str | Path, jobs: int = 1):
+def iter_run(
+    configuration_path: str | Path,
+    jobs: int = 1,
+    *,
+    _log_queue: Any | None = None,
+):
     """Yield durable per-model order files as soon as their searches finish."""
     if jobs < 1:
         raise ValueError("jobs must be at least 1")
@@ -544,11 +599,33 @@ def iter_run(configuration_path: str | Path, jobs: int = 1):
             yield _analyze_and_save_model(task)
     else:
         LOGGER.info("Selecting orders with %s worker processes", jobs)
-        with ProcessPoolExecutor(max_workers=jobs) as executor:
-            futures = [executor.submit(_analyze_and_save_model, task) for task in tasks]
-            for future in as_completed(futures):
-                # Each worker has already written its one-row order file.
-                yield future.result()
+        executor_options: dict[str, Any] = {
+            "max_workers": jobs,
+            "max_tasks_per_child": 1,
+            "mp_context": multiprocessing.get_context("spawn"),
+        }
+        if _log_queue is not None:
+            executor_options.update(
+                initializer=_configure_worker_logging,
+                initargs=(_log_queue,),
+            )
+        with ProcessPoolExecutor(**executor_options) as executor:
+            task_iterator = iter(tasks)
+            pending = {
+                executor.submit(_analyze_and_save_model, task)
+                for task in (next(task_iterator, None) for _ in range(jobs))
+                if task is not None
+            }
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    # Each worker has already written its model and order file.
+                    yield future.result()
+                    next_task = next(task_iterator, None)
+                    if next_task is not None:
+                        pending.add(
+                            executor.submit(_analyze_and_save_model, next_task)
+                        )
 
     yield from save_skipped(pd.DataFrame(skipped_records))
 
@@ -586,41 +663,50 @@ def save_skipped(skipped: pd.DataFrame) -> list[Path]:
     return outputs
 
 
-def _analyze_dataset_isolated(
-    row: pd.Series,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Analyze one row without sharing mutable state between worker processes."""
-    skipped: list[dict[str, object]] = []
-    return analyze_dataset(row, skipped), skipped
+def save_orders_manifest(outputs: list[Path]) -> Path | None:
+    """Combine this run's per-model order artifacts into one predictor input."""
+    order_paths: list[Path] = []
+    timestamps: set[str] = set()
+    for path in outputs:
+        match = ORDERS_FILENAME_PATTERN.fullmatch(path.name)
+        if match is None:
+            continue
+        order_paths.append(path)
+        timestamps.add(match.group(1))
+
+    if not order_paths:
+        return None
+    if len(timestamps) != 1:
+        raise ValueError("Cannot combine order artifacts from different runs")
+
+    orders = pd.concat(
+        (pd.read_csv(path) for path in order_paths),
+        ignore_index=True,
+        sort=False,
+    )
+    if MODEL_NUMBER_COLUMN in orders:
+        orders = orders.sort_values(MODEL_NUMBER_COLUMN, kind="stable")
+
+    timestamp = timestamps.pop()
+    output = solve_path(
+        Path("data") / "orders" / timestamp / f"orders_{timestamp}.csv"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    orders.to_csv(output, index=False)
+    LOGGER.info(
+        "Saved combined orders manifest with %s model(s) to %s",
+        len(orders),
+        output,
+    )
+    return output
 
 
 def run(configuration_path: str | Path, jobs: int = 1) -> list[Path]:
-    """Analyze eligible rows and save orders plus details of skipped datasets."""
-    if jobs < 1:
-        raise ValueError("jobs must be at least 1")
-    configuration = read_configuration(configuration_path)
-    LOGGER.info(
-        "Loaded %s analysis specification(s) from %s",
-        len(configuration),
-        solve_path(configuration_path),
-    )
-    result_records: list[dict[str, object]] = []
-    skipped_records: list[dict[str, object]] = []
-    rows = [row for _, row in configuration.iterrows()]
-    if jobs == 1:
-        analyses = (_analyze_dataset_isolated(row) for row in rows)
-        for results, skipped in analyses:
-            result_records.extend(results)
-            skipped_records.extend(skipped)
-    else:
-        LOGGER.info("Analyzing configuration rows with %s worker processes", jobs)
-        with ProcessPoolExecutor(max_workers=jobs) as executor:
-            for results, skipped in executor.map(_analyze_dataset_isolated, rows):
-                result_records.extend(results)
-                skipped_records.extend(skipped)
-
-    outputs = save_results(pd.DataFrame(result_records))
-    outputs.extend(save_skipped(pd.DataFrame(skipped_records)))
+    """Save every fit plus a combined order manifest for separate prediction."""
+    outputs = list(iter_run(configuration_path, jobs=jobs))
+    manifest = save_orders_manifest(outputs)
+    if manifest is not None:
+        outputs.append(manifest)
     return outputs
 
 
@@ -635,8 +721,18 @@ def main() -> None:
         help="configuration rows to process concurrently (default: %(default)s)",
     )
     args = parser.parse_args()
-    for output in run(args.configuration, jobs=args.jobs):
+    outputs = run(args.configuration, jobs=args.jobs)
+    for output in outputs:
         print(f"Saved {output}")
+    manifest = (
+        outputs[-1]
+        if outputs
+        and outputs[-1].parent.parent.name == "orders"
+        and ORDERS_FILENAME_PATTERN.fullmatch(outputs[-1].name)
+        else None
+    )
+    if manifest is not None:
+        print(f"Use for prediction: --orders {manifest}")
 
 
 if __name__ == "__main__":

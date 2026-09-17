@@ -77,13 +77,20 @@ def merge_driver(
     cases = cases.copy()
     driver = driver.copy()
     driver["valid_time"] = pd.to_datetime(driver["valid_time"], errors="coerce")
-    cases["valid_time"] = pd.to_datetime(
-        cases["month" if frequency == "monthly" else "week"], errors="coerce"
-    )
+    date_column = "month" if frequency == "monthly" else "week"
+    case_dates = pd.to_datetime(cases[date_column], errors="coerce")
     if frequency == "monthly":
-        cases["valid_time"] += pd.offsets.MonthEnd(0)
+        case_dates += pd.offsets.MonthEnd(0)
     else:
         driver["valid_time"] += pd.Timedelta(days=1)
+
+    # After the first outer join, driver-only rows have no case date but do
+    # have a valid_time.  Preserve that timestamp during subsequent merges.
+    if "valid_time" in cases:
+        existing_dates = pd.to_datetime(cases["valid_time"], errors="coerce")
+        cases["valid_time"] = existing_dates.combine_first(case_dates)
+    else:
+        cases["valid_time"] = case_dates
 
     invalid_cases = int(cases["valid_time"].isna().sum())
     if invalid_cases:
@@ -147,6 +154,23 @@ def _load_drivers(frequency: str, mode: str) -> list[tuple[pd.DataFrame, Path]]:
     return [(pd.read_csv(solve_path(path), index_col=index), solve_path(path)) for path, index in specs]
 
 
+def _fill_internal_case_gaps(data: pd.DataFrame) -> pd.DataFrame:
+    """Set missing case counts to zero only within the observed case timeline."""
+    data = data.copy()
+    observed = data["n_accesses"].notna() & data["valid_time"].notna()
+    if not observed.any():
+        return data
+
+    first_case = data.loc[observed, "valid_time"].min()
+    last_case = data.loc[observed, "valid_time"].max()
+    internal_gap = (
+        data["n_accesses"].isna()
+        & data["valid_time"].between(first_case, last_case)
+    )
+    data.loc[internal_gap, "n_accesses"] = 0
+    return data
+
+
 def build_dataset(variant: str, frequency: str, hospital: str, mode: str) -> Path:
     """Build one aggregated dataset and return its output path without a suffix."""
     source, output = _case_paths(variant, frequency, hospital, mode)
@@ -154,6 +178,7 @@ def build_dataset(variant: str, frequency: str, hospital: str, mode: str) -> Pat
     warn_about_missing_periods(cases, frequency, source)
     for driver, path in _load_drivers(frequency, mode):
         cases = merge_driver(cases, driver, frequency, str(path))
+    cases = _fill_internal_case_gaps(cases)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     cases.to_pickle(output.with_suffix(".pkl"))
