@@ -63,6 +63,9 @@ class RecordingArima:
         # Depending on history makes the test verify extraction happens before updates.
         return [float(len(self.history)), 0.25]
 
+    def pvalues(self):
+        return [0.01, 0.02]
+
     @property
     def arima_res_(self):
         class Result:
@@ -159,7 +162,10 @@ class PredictArimaTests(unittest.TestCase):
         self.assertEqual(result["training_aic"].unique().tolist(), [123.5])
         self.assertEqual(
             json.loads(result["fitted_parameters"].iloc[0]),
-            {"ar.L1": 3.0, "sigma2": 0.25},
+            {
+                "parameters": {"ar.L1": 3.0, "sigma2": 0.25},
+                "pvalues": {"ar.L1": 0.01, "sigma2": 0.02},
+            },
         )
 
     def test_limits_mle_iterations_for_each_update(self):
@@ -524,11 +530,15 @@ class PredictArimaTests(unittest.TestCase):
                 [
                     root
                     / "data"
+                    / "output"
+                    / "20260909_153012"
                     / "weekly"
                     / "predictions"
                     / "general_20260909_153012.csv",
                     root
                     / "data"
+                    / "output"
+                    / "20260909_153012"
                     / "monthly"
                     / "predictions"
                     / "pediatrico_20260909_153012.csv",

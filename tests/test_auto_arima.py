@@ -87,7 +87,10 @@ class AutoArimaThresholdTests(unittest.TestCase):
 
             self.assertEqual(len(outputs), 2)
             per_model, manifest = outputs
-            self.assertEqual(manifest.parent.parent, root / "data" / "orders")
+            self.assertEqual(manifest.parent.parent.parent, root / "data" / "output")
+            self.assertTrue(
+                (manifest.parent.parent / "configuration.csv").is_file()
+            )
             self.assertEqual(manifest.name, per_model.name)
             combined = pd.read_csv(manifest)
             self.assertEqual(combined["model_number"].tolist(), [1])
@@ -188,10 +191,10 @@ class AutoArimaThresholdTests(unittest.TestCase):
             )
 
             weekly_report = pd.read_csv(
-                root / "data" / "weekly" / "orders" / "skipped.csv"
+                weekly_orders_path.parents[3] / "weekly" / "orders" / "skipped.csv"
             )
             monthly_report = pd.read_csv(
-                root / "data" / "monthly" / "orders" / "skipped.csv"
+                monthly_orders_path.parents[3] / "monthly" / "orders" / "skipped.csv"
             )
             self.assertEqual(
                 weekly_report["path_to_training_file"].tolist(),

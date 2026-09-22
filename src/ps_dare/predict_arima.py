@@ -10,7 +10,7 @@ state without refitting or limit the update's MLE iterations.
 From the repository root, run::
 
     python -m ps_dare.predict_arima \
-        --orders data/orders/20240101_120000/orders_20240101_120000.csv
+        --orders data/output/20240101_120000/orders/orders_20240101_120000.csv
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from .auto_arima import (
     load_training_file,
 )
 from .explorer import ALL_CATEGORIES, prepare_timeseries
-from .paths import solve_path
+from .paths import output_path, solve_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -240,7 +240,7 @@ def _prediction_file_id(
 
 
 def _training_fit_statistics(model: Any) -> tuple[float, str]:
-    """Extract AIC and named coefficients before rolling updates modify the fit."""
+    """Extract AIC, coefficients, and p-values before rolling updates."""
     try:
         aic = float(model.aic())
     except (AttributeError, TypeError, ValueError):
@@ -253,12 +253,22 @@ def _training_fit_statistics(model: Any) -> tuple[float, str]:
     except (AttributeError, TypeError, ValueError):
         values = list(getattr(result, "params", []))
 
+    try:
+        pvalues = list(model.pvalues())
+    except (AttributeError, TypeError, ValueError):
+        pvalues = list(getattr(result, "pvalues", []))
+
     if not names and values:
         names = [f"parameter_{number + 1}" for number in range(len(values))]
     parameters = {
         str(name): float(value) for name, value in zip(names, values, strict=False)
     }
-    return aic, json.dumps(parameters, sort_keys=True)
+    named_pvalues = {
+        str(name): float(pvalue)
+        for name, pvalue in zip(names, pvalues, strict=False)
+    }
+    statistics = {"parameters": parameters, "pvalues": named_pvalues}
+    return aic, json.dumps(statistics, sort_keys=True)
 
 
 def _save_fitted_model(model: Any, output: Path) -> None:
@@ -378,12 +388,12 @@ def _model_output_path(
     discretization = _discretization(row["discretization"])
     dataset = _dataset_path(row, frequency, discretization)
     model_id = _model_id(row_number, dataset, _driver_name(row))
-    return solve_path(
-        Path("data")
-        / frequency
-        / "models"
-        / dataset.stem
-        / f"{model_id}_{timestamp}.pkl"
+    return output_path(
+        timestamp,
+        frequency,
+        "models",
+        dataset.stem,
+        f"{model_id}_{timestamp}.pkl",
     )
 
 
@@ -401,12 +411,12 @@ def _prediction_output_path(
         frequency,
         row["lag"],
     )
-    return solve_path(
-        Path("data")
-        / frequency
-        / "predictions"
-        / dataset.stem
-        / f"{prediction_file_id}_{timestamp}.csv"
+    return output_path(
+        timestamp,
+        frequency,
+        "predictions",
+        dataset.stem,
+        f"{prediction_file_id}_{timestamp}.csv",
     )
 
 
@@ -752,11 +762,11 @@ def save_predictions(predictions: pd.DataFrame, timestamp: str) -> list[Path]:
         ["aggregation", "path_to_training_file"], sort=False
     )
     for (frequency, training_file), rows in grouped:
-        output = solve_path(
-            Path("data")
-            / str(frequency)
-            / "predictions"
-            / f"{Path(str(training_file)).stem}_{timestamp}.csv"
+        output = output_path(
+            timestamp,
+            str(frequency),
+            "predictions",
+            f"{Path(str(training_file)).stem}_{timestamp}.csv",
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         rows.to_csv(output, index=False, date_format="%Y-%m-%d")

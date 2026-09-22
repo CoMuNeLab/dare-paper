@@ -116,7 +116,12 @@ def _run_parallel_models(
         while pending:
             completed, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in completed:
-                outputs.extend(future.result())
+                try:
+                    outputs.extend(future.result())
+                except Exception:
+                    LOGGER.exception(
+                        "Model pipeline failed; continuing with the next model"
+                    )
                 next_task = next(task_iterator, None)
                 if next_task is not None:
                     pending.add(executor.submit(_select_predict_and_save, next_task))
@@ -140,6 +145,7 @@ def run(
     predict_arima._validate_update_options(state_only_updates, update_maxiter)
 
     outputs: list[Path] = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     for configuration in configuration_paths:
         LOGGER.info("Starting ARIMA pipeline for %s", configuration)
         try:
@@ -148,6 +154,8 @@ def run(
             # Retain compatibility with callers that provide configuration
             # through a mocked/custom ``iter_run`` implementation.
             configuration_frame = None
+        else:
+            auto_arima.copy_configuration(configuration, timestamp)
         has_baseline = (
             configuration_frame is not None
             and configuration_frame["driver_kind"]
@@ -159,7 +167,9 @@ def run(
         )
         if not has_baseline and (jobs == 1 or configuration_frame is None):
             found_order = False
-            for selection_output in auto_arima.iter_run(configuration, jobs=1):
+            for selection_output in auto_arima.iter_run(
+                configuration, jobs=1, timestamp=timestamp
+            ):
                 outputs.append(selection_output)
                 if not _order_tables([selection_output]):
                     continue
@@ -170,9 +180,15 @@ def run(
                     prediction_options["state_only_updates"] = True
                 elif update_maxiter is not None:
                     prediction_options["update_maxiter"] = update_maxiter
-                outputs.extend(
-                    predict_arima.run(selection_output, **prediction_options)
-                )
+                try:
+                    outputs.extend(
+                        predict_arima.run(selection_output, **prediction_options)
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Prediction failed for %s; continuing with the next model",
+                        selection_output,
+                    )
                 gc.collect()
             if not found_order:
                 LOGGER.warning(
@@ -190,17 +206,23 @@ def run(
         model_rows, skipped_records = auto_arima._expanded_model_rows(
             configuration_frame
         )
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         tasks = [
             (row, timestamp, state_only_updates, update_maxiter)
             for row in model_rows
         ]
         if jobs == 1:
             for task in tasks:
-                outputs.extend(_select_predict_and_save(task))
+                try:
+                    outputs.extend(_select_predict_and_save(task))
+                except Exception:
+                    LOGGER.exception(
+                        "Model pipeline failed; continuing with the next model"
+                    )
         else:
             outputs.extend(_run_parallel_models(tasks, jobs, _worker_log_queue))
-        outputs.extend(auto_arima.save_skipped(pd.DataFrame(skipped_records)))
+        outputs.extend(
+            auto_arima.save_skipped(pd.DataFrame(skipped_records), timestamp)
+        )
 
         if not model_rows:
             LOGGER.warning(

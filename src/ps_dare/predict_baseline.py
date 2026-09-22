@@ -29,7 +29,7 @@ from .auto_arima import (
     read_configuration,
 )
 from .explorer import ALL_CATEGORIES, prepare_timeseries
-from .paths import solve_path
+from .paths import output_path
 from .predict_arima import (
     CONFIDENCE_ALPHA,
     _metrics_output_path,
@@ -168,12 +168,12 @@ def _output_path(predictions: pd.DataFrame, timestamp: str) -> Path:
         if pd.isna(model_number)
         else f"_model_{int(model_number):03d}"
     )
-    return solve_path(
-        Path("data")
-        / frequency
-        / "predictions"
-        / dataset
-        / f"{dataset}_baseline_{frequency}{model_suffix}_{timestamp}.csv"
+    return output_path(
+        timestamp,
+        frequency,
+        "predictions",
+        dataset,
+        f"{dataset}_baseline_{frequency}{model_suffix}_{timestamp}.csv",
     )
 
 

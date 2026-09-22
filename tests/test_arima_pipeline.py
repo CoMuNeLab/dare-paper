@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pandas as pd
 
@@ -50,6 +50,9 @@ class ArimaPipelineTests(unittest.TestCase):
                 outputs = run([configuration])
 
             self.assertEqual(len(outputs), 2)
+            run_directory = outputs[0].parents[3]
+            self.assertEqual(run_directory.parent, root / "data" / "output")
+            self.assertTrue((run_directory / configuration.name).is_file())
             predictions = pd.read_csv(outputs[0])
             metrics = pd.read_csv(outputs[1])
             self.assertEqual(predictions["method"].unique().tolist(), ["baseline"])
@@ -96,9 +99,15 @@ class ArimaPipelineTests(unittest.TestCase):
             ],
         )
         self.assertEqual(auto_iter.call_args_list[0].args, ("first.csv",))
-        self.assertEqual(auto_iter.call_args_list[0].kwargs, {"jobs": 1})
+        self.assertEqual(
+            auto_iter.call_args_list[0].kwargs,
+            {"jobs": 1, "timestamp": ANY},
+        )
         self.assertEqual(auto_iter.call_args_list[1].args, ("second.csv",))
-        self.assertEqual(auto_iter.call_args_list[1].kwargs, {"jobs": 1})
+        self.assertEqual(
+            auto_iter.call_args_list[1].kwargs,
+            {"jobs": 1, "timestamp": ANY},
+        )
         self.assertEqual(predict_run.call_args_list[0].args, (first_orders,))
         self.assertEqual(predict_run.call_args_list[0].kwargs, {"jobs": 1})
         self.assertEqual(predict_run.call_args_list[1].args, (second_orders,))
@@ -114,6 +123,24 @@ class ArimaPipelineTests(unittest.TestCase):
 
         self.assertEqual(run(["configuration.csv"]), [skipped])
         predict_run.assert_not_called()
+
+    @patch("ps_dare.arima_pipeline.predict_arima.run")
+    @patch("ps_dare.arima_pipeline.auto_arima.iter_run")
+    def test_logs_prediction_failure_and_continues_with_next_model(
+        self, auto_iter, predict_run
+    ):
+        first_orders = Path("orders_20260911_120000.csv")
+        second_orders = Path("orders_20260911_120001.csv")
+        prediction = Path("prediction.csv")
+        auto_iter.return_value = [first_orders, second_orders]
+        predict_run.side_effect = [ValueError("failed fit"), [prediction]]
+
+        with self.assertLogs(LOGGER, level="ERROR") as captured:
+            outputs = run(["configuration.csv"])
+
+        self.assertEqual(outputs, [first_orders, second_orders, prediction])
+        self.assertIn("failed fit", "\n".join(captured.output))
+        self.assertEqual(predict_run.call_count, 2)
 
     def test_requires_a_configuration(self):
         with self.assertRaisesRegex(ValueError, "At least one configuration"):

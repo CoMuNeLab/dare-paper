@@ -25,7 +25,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from . import arima_pipeline, auto_arima, predict_arima
-from .paths import solve_path
+from .paths import output_path, solve_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -225,13 +225,12 @@ def _expected_order_path(row: pd.Series, timestamp: str) -> Path:
         "drivers_used": driver,
         auto_arima.MODEL_NUMBER_COLUMN: int(row[auto_arima.MODEL_NUMBER_COLUMN]),
     }
-    return solve_path(
-        Path("data")
-        / frequency
-        / "orders"
-        / timestamp
-        / auto_arima._model_slug(record)
-        / f"orders_{timestamp}.csv"
+    return output_path(
+        timestamp,
+        frequency,
+        "orders",
+        auto_arima._model_slug(record),
+        f"orders_{timestamp}.csv",
     )
 
 
@@ -386,7 +385,7 @@ def recover(
     predict_arima._validate_update_options(selected_state_only, selected_maxiter)
 
     items: list[RecoveryItem] = []
-    skipped_frames: list[pd.DataFrame] = []
+    skipped_frames: list[tuple[pd.DataFrame, str]] = []
     total_models = 0
     for configured in logged.configurations:
         LOGGER.info(
@@ -403,7 +402,9 @@ def recover(
             if (item := _recovery_item(row, configured.timestamp)) is not None
         )
         if skipped_records:
-            skipped_frames.append(pd.DataFrame(skipped_records))
+            skipped_frames.append(
+                (pd.DataFrame(skipped_records), configured.timestamp)
+            )
 
     counts = {
         action: sum(item.action == action for item in items)
@@ -423,8 +424,8 @@ def recover(
         for item in items
     ]
     outputs = _run_recovery_tasks(tasks, selected_jobs, _worker_log_queue)
-    for skipped in skipped_frames:
-        outputs.extend(auto_arima.save_skipped(skipped))
+    for skipped, timestamp in skipped_frames:
+        outputs.extend(auto_arima.save_skipped(skipped, timestamp))
     LOGGER.info("Pipeline recovery completed successfully")
     return RecoveryResult(
         already_complete=already_complete,

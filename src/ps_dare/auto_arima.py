@@ -5,7 +5,8 @@ Run this module from the repository root with::
     python -m ps_dare.auto_arima path/to/datasets.csv
 
 In addition to the per-model order artifacts, the standalone command writes a
-combined ``orders_YYYYMMDD_HHMMSS.csv`` manifest below ``data/orders``. Pass
+combined ``orders_YYYYMMDD_HHMMSS.csv`` manifest below the timestamped
+``data/output`` run directory. Pass
 that manifest to ``ps_dare.predict_arima --orders`` to test all saved models.
 
 The configuration accepts the following columns (spaces may be used instead of
@@ -16,7 +17,7 @@ the predefined model ``(1, 1, 1)(2, 0, 0)[m]`` without exogenous drivers.
 Datasets are fitted only when every training timestep has more than the
 configured weekly or monthly case threshold. Each completed fit is serialized
 and its path is recorded in the corresponding order table. Rejected datasets
-are recorded in ``data/<weekly|monthly>/orders/skipped.csv`` instead.
+are recorded in the run's ``<weekly|monthly>/orders/skipped.csv`` instead.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import logging
 import multiprocessing
 import pickle
 import re
+import shutil
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from logging.handlers import QueueHandler
 from pathlib import Path
@@ -34,7 +36,7 @@ from typing import Any
 import pandas as pd
 
 from .explorer import ALL_CATEGORIES, driver_columns, prepare_timeseries
-from .paths import solve_path
+from .paths import output_path, solve_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -527,12 +529,12 @@ def _model_slug(record: dict[str, object]) -> str:
 def _model_output_path(record: dict[str, object], timestamp: str) -> Path:
     """Return the path for the fitted model associated with an order record."""
     dataset = Path(str(record["path_to_training_file"])).stem
-    return solve_path(
-        Path("data")
-        / str(record["aggregation"])
-        / "models"
-        / dataset
-        / f"{_model_slug(record)}_{timestamp}.pkl"
+    return output_path(
+        timestamp,
+        str(record["aggregation"]),
+        "models",
+        dataset,
+        f"{_model_slug(record)}_{timestamp}.pkl",
     )
 
 
@@ -548,13 +550,12 @@ def _save_model_order(
     record["model_file"] = str(model_output)
     LOGGER.info("Saved fitted Auto-ARIMA model to %s", model_output)
 
-    output = solve_path(
-        Path("data")
-        / str(record["aggregation"])
-        / "orders"
-        / timestamp
-        / _model_slug(record)
-        / f"orders_{timestamp}.csv"
+    output = output_path(
+        timestamp,
+        str(record["aggregation"]),
+        "orders",
+        _model_slug(record),
+        f"orders_{timestamp}.csv",
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([record]).to_csv(output, index=False)
@@ -579,6 +580,7 @@ def iter_run(
     configuration_path: str | Path,
     jobs: int = 1,
     *,
+    timestamp: str | None = None,
     _log_queue: Any | None = None,
 ):
     """Yield durable per-model order files as soon as their searches finish."""
@@ -591,12 +593,17 @@ def iter_run(
         solve_path(configuration_path),
     )
     model_rows, skipped_records = _expanded_model_rows(configuration)
-    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = timestamp or pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
     tasks = [(row, timestamp) for row in model_rows]
 
     if jobs == 1:
         for task in tasks:
-            yield _analyze_and_save_model(task)
+            try:
+                yield _analyze_and_save_model(task)
+            except Exception:
+                LOGGER.exception(
+                    "Model selection failed; continuing with the next model"
+                )
     else:
         LOGGER.info("Selecting orders with %s worker processes", jobs)
         executor_options: dict[str, Any] = {
@@ -620,27 +627,30 @@ def iter_run(
                 completed, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for future in completed:
                     # Each worker has already written its model and order file.
-                    yield future.result()
+                    try:
+                        yield future.result()
+                    except Exception:
+                        LOGGER.exception(
+                            "Model selection failed; continuing with the next model"
+                        )
                     next_task = next(task_iterator, None)
                     if next_task is not None:
                         pending.add(
                             executor.submit(_analyze_and_save_model, next_task)
                         )
 
-    yield from save_skipped(pd.DataFrame(skipped_records))
+    yield from save_skipped(pd.DataFrame(skipped_records), timestamp)
 
 
-def save_results(results: pd.DataFrame) -> list[Path]:
+def save_results(results: pd.DataFrame, timestamp: str | None = None) -> list[Path]:
     """Save one order table below each frequency's ``orders`` directory."""
     outputs: list[Path] = []
     if results.empty:
         return outputs
 
-    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = timestamp or pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
     for frequency, rows in results.groupby("aggregation", sort=False):
-        output = solve_path(
-            Path("data") / frequency / "orders" / f"orders_{timestamp}.csv"
-        )
+        output = output_path(timestamp, frequency, "orders", f"orders_{timestamp}.csv")
         output.parent.mkdir(parents=True, exist_ok=True)
         rows.to_csv(output, index=False)
         LOGGER.info("Saved %s model result(s) to %s", len(rows), output)
@@ -648,14 +658,14 @@ def save_results(results: pd.DataFrame) -> list[Path]:
     return outputs
 
 
-def save_skipped(skipped: pd.DataFrame) -> list[Path]:
+def save_skipped(skipped: pd.DataFrame, timestamp: str) -> list[Path]:
     """Save skipped dataset details beside each frequency's order tables."""
     outputs: list[Path] = []
     if skipped.empty:
         return outputs
 
     for frequency, rows in skipped.groupby("aggregation", sort=False):
-        output = solve_path(Path("data") / frequency / "orders" / "skipped.csv")
+        output = output_path(timestamp, frequency, "orders", "skipped.csv")
         output.parent.mkdir(parents=True, exist_ok=True)
         rows.to_csv(output, index=False)
         LOGGER.info("Saved %s skipped dataset(s) to %s", len(rows), output)
@@ -688,9 +698,7 @@ def save_orders_manifest(outputs: list[Path]) -> Path | None:
         orders = orders.sort_values(MODEL_NUMBER_COLUMN, kind="stable")
 
     timestamp = timestamps.pop()
-    output = solve_path(
-        Path("data") / "orders" / timestamp / f"orders_{timestamp}.csv"
-    )
+    output = output_path(timestamp, "orders", f"orders_{timestamp}.csv")
     output.parent.mkdir(parents=True, exist_ok=True)
     orders.to_csv(output, index=False)
     LOGGER.info(
@@ -701,9 +709,28 @@ def save_orders_manifest(outputs: list[Path]) -> Path | None:
     return output
 
 
+def copy_configuration(configuration_path: str | Path, timestamp: str) -> Path:
+    """Copy an analysis directives CSV into its timestamped output folder."""
+    source = solve_path(configuration_path)
+    destination = output_path(timestamp, source.name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.resolve() != source.resolve():
+        number = 2
+        while destination.exists():
+            destination = destination.with_name(
+                f"{source.stem}_{number}{source.suffix}"
+            )
+            number += 1
+    shutil.copy2(source, destination)
+    LOGGER.info("Copied analysis directives to %s", destination)
+    return destination
+
+
 def run(configuration_path: str | Path, jobs: int = 1) -> list[Path]:
     """Save every fit plus a combined order manifest for separate prediction."""
-    outputs = list(iter_run(configuration_path, jobs=jobs))
+    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    copy_configuration(configuration_path, timestamp)
+    outputs = list(iter_run(configuration_path, jobs=jobs, timestamp=timestamp))
     manifest = save_orders_manifest(outputs)
     if manifest is not None:
         outputs.append(manifest)
@@ -727,7 +754,7 @@ def main() -> None:
     manifest = (
         outputs[-1]
         if outputs
-        and outputs[-1].parent.parent.name == "orders"
+        and outputs[-1].parent.name == "orders"
         and ORDERS_FILENAME_PATTERN.fullmatch(outputs[-1].name)
         else None
     )
