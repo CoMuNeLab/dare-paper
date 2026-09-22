@@ -78,14 +78,14 @@ python -m src.ps_dare.auto_arima --jobs 6 auto_arima_example.csv
 
 The standalone selector saves each fitted model immediately and then produces
 one combined manifest at
-`data/orders/<timestamp>/orders_<timestamp>.csv`. Each manifest row contains
+`data/output/<timestamp>/orders/orders_<timestamp>.csv`. Each manifest row contains
 the selected orders and the `model_file` path of the exact fitted model. Use
 the manifest printed as `Use for prediction` to run the prediction stage
 separately:
 
 ```bash
 python -m src.ps_dare.predict_arima \
-  --orders data/orders/20260915_114627/orders_20260915_114627.csv \
+  --orders data/output/20260915_114627/orders/orders_20260915_114627.csv \
   --jobs 6
 ```
 
@@ -146,7 +146,7 @@ Alternatively, the positional form remains supported for an existing orders
 file:
 
 ```bash
-python -m src.ps_dare.predict_arima data/orders/20260915_114627/orders_20260915_114627.csv
+python -m src.ps_dare.predict_arima data/output/20260915_114627/orders/orders_20260915_114627.csv
 ```
 
 Each saved model is calibrated once on its configured training period. After
@@ -156,7 +156,7 @@ the complete access series, the selected driver and its value when applicable,
 and predictions with their 95% confidence interval lower and upper bounds for
 the configured testing window. A completed simulation is immediately written
 to its own file at
-`data/<weekly|monthly>/predictions/<dataset>/<dataset>_<driver>_<aggregation>_lag_<lag>_model_<NNN>_<timestamp>.csv`.
+`data/output/<timestamp>/<weekly|monthly>/predictions/<dataset>/<dataset>_<driver>_<aggregation>_lag_<lag>_model_<NNN>_<timestamp>.csv`.
 For example:
 `general_no2_mean_weekly_lag_1_model_007_20260914_153012.csv`.
 Completed simulation DataFrames are never retained while other models finish,
@@ -164,7 +164,7 @@ so an interrupted batch preserves every finished result file.
 
 After each prediction file is saved, the same worker writes a one-row model
 summary with the identical filename under
-`data/<weekly|monthly>/metrics/<dataset>/`. This metrics CSV includes the model
+`data/output/<timestamp>/<weekly|monthly>/metrics/<dataset>/`. This metrics CSV includes the model
 number and ID, dataset name and path, hospital, subset, category, temporal
 aggregation, driver and lag, discretization, training/testing dates and sample
 counts, ARIMA orders, intercept, update strategy, fitted parameters, model
@@ -176,14 +176,20 @@ until both its prediction and metrics files have been written.
 
 The prediction output also stores `training_aic` and `fitted_parameters`. These
 are captured immediately after the initial training fit, before rolling test
-observations update the model. `fitted_parameters` is a JSON object mapping
-coefficient names to values. To calculate out-of-sample MAPE, use only rows
+observations update the model. `fitted_parameters` is a JSON object containing
+parallel `parameters` and `pvalues` mappings from coefficient names to values.
+To calculate out-of-sample MAPE, use only rows
 whose `phase` is `testing`, comparing `n_accesses` with `prediction`. The
 metrics stage applies the zero-actual policy described above.
 
+Every pipeline execution writes its artifacts below
+`data/output/<timestamp>/` and copies each analysis-directives CSV into that
+directory. Inside it, the existing `weekly`/`monthly` hierarchy is preserved
+for predictions, metrics, models, and orders.
+
 Every initial training fit is serialized by Auto-ARIMA, before its order table
-is published, as a pickle file:
-`data/<weekly|monthly>/models/<dataset>/<model_id>_<timestamp>.pkl`. The dataset
+is published, as a pickle file under
+`data/output/<timestamp>/<weekly|monthly>/models/<dataset>/`. The dataset
 directory, model ID (including the driver), row number, and orders-file
 timestamp uniquely identify the fitted model. Both the order table and the
 prediction CSV record its path in `model_file`; prediction loads this artifact
