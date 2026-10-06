@@ -59,6 +59,9 @@ FORCED_ORDER = (1, 1, 1)
 FORCED_SEASONAL_ORDER = (2, 0, 0)
 FORCED_INTERCEPT = True
 ORDERS_FILENAME_PATTERN = re.compile(r"orders_(\d{8}_\d{6})\.csv")
+NO_SAMPLES_AFTER_SEASONAL_DIFFERENCING = (
+    "There are no more samples after a first-order seasonal differencing."
+)
 
 # Only drivers listed here are calibrated.  Each available driver produces a
 # separate model; it is never combined with another driver from the list.
@@ -280,6 +283,33 @@ def checked_driver_data(
     return X
 
 
+def _fit_auto_arima_with_fallback(
+    auto_arima: Any,
+    y: pd.Series,
+    X: pd.DataFrame | None,
+    seasonal_period: int,
+) -> Any:
+    """Retry with no seasonal differencing only when differencing exhausts y."""
+    parameters = {
+        "X": X,
+        "seasonal": True,
+        "m": seasonal_period,
+        "stepwise": True,
+        "suppress_warnings": True,
+        "error_action": "ignore",
+    }
+    try:
+        return auto_arima(y, **parameters)
+    except ValueError as error:
+        if NO_SAMPLES_AFTER_SEASONAL_DIFFERENCING not in str(error):
+            raise
+        LOGGER.warning(
+            "Auto-ARIMA exhausted the training samples during seasonal "
+            "differencing; retrying with D=0"
+        )
+        return auto_arima(y, D=0, **parameters)
+
+
 def analyze_dataset(
     row: pd.Series,
     skipped: list[dict[str, object]] | None = None,
@@ -398,14 +428,11 @@ def analyze_dataset(
                 suppress_warnings=True,
             ).fit(y)
         else:
-            model = pmd_auto_arima(
+            model = _fit_auto_arima_with_fallback(
+                pmd_auto_arima,
                 y,
-                X=X,
-                seasonal=True,
-                m=seasonal_period,
-                stepwise=True,
-                suppress_warnings=True,
-                error_action="ignore",
+                X,
+                seasonal_period,
             )
         p, d, q = model.order
         P, D, Q, m = model.seasonal_order

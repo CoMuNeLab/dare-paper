@@ -48,19 +48,19 @@ extract_model_pvalues <- function(models) {
     }))
 }
 
-results <- read.csv("/Users/tommasobertola/Git/ps-dare-paper-2/data/output/protocol-2/res_prot2.csv")
+results <- read.csv("/Users/tommasobertola/Git/ps-dare-paper-2/data/output/protocol-2/res_prot2_with_missing.csv")
 results %>% colnames()
 
 dataset_labels <- c(
-    general_giustiniani = "General - ER Giustiniani",
-    general_osa = "General - ER Sant'Antonio",
-    general_pediatrico = "General - ER Pediatrico",
-    hw_giustiniani = "HRI - ER Giustiniani",
-    hw_osa = "HRI - ER Sant'Antonio",
-    hw_pediatrico = "HRI - ER Pediatrico",
-    ili_giustiniani = "ILI - ER Giustiniani",
-    ili_osa = "ILI - ER Sant'Antonio",
-    ili_pediatrico = "ILI - ER Pediatrico"
+    general_giustiniani = "General - Giustiniani ED",
+    general_osa = "General - Sant'Antonio ED",
+    general_pediatrico = "General - Pediatric ED",
+    hw_giustiniani = "HRI - Giustiniani ED",
+    hw_osa = "HRI - Sant'Antonio ED",
+    hw_pediatrico = "HRI - Pediatric ED",
+    ili_giustiniani = "ILI - Giustiniani ED",
+    ili_osa = "ILI - Sant'Antonio ED",
+    ili_pediatrico = "ILI - Pediatric ED"
 )
 
 driver_kind_labels <- c(
@@ -260,10 +260,18 @@ ggsave(
 
 
 prot_1_weekly %>%
+    # Keep the best model for each driver kind, so the no-driver model does
+    # not suppress the best model with a driver when it has a lower MAPE.
+    group_by(dataset_name, driver_kind) %>%
+    slice_min(mape, n = 1, with_ties = FALSE) %>%
     group_by(dataset_name) %>%
-    filter(mape == min(mape) | driver_kind == "none") %>%
     select(dataset_name, lag, driver_kind, driver, aic, mape, ae) %>%
     mutate(delta_aic = aic - min(aic, na.rm = TRUE)) %>%
+    bind_rows(
+        prot_1_weekly_baseline %>%
+            select(dataset_name, lag, driver_kind, driver, aic, mape, ae) %>%
+            mutate(delta_aic = NA_real_)
+    ) %>%
     arrange(dataset_name, lag, driver_kind) %>%
     write.csv("graphs/fig3_prot2_weekly.csv", row.names = FALSE)
 
@@ -426,9 +434,17 @@ ggsave(
 
 
 prot_1_monthly %>%
+    # Keep the best model for each driver kind, so the no-driver model does
+    # not suppress the best model with a driver when it has a lower MAPE.
+    group_by(dataset_name, driver_kind) %>%
+    slice_min(mape, n = 1, with_ties = FALSE) %>%
     group_by(dataset_name) %>%
-    filter(mape == min(mape) | driver_kind == "none") %>%
     select(dataset_name, lag, driver_kind, driver, aic, mape, ae) %>%
     mutate(delta_aic = aic - min(aic, na.rm = TRUE)) %>%
+    bind_rows(
+        prot_1_monthly_baseline %>%
+            select(dataset_name, lag, driver_kind, driver, aic, mape, ae) %>%
+            mutate(delta_aic = NA_real_)
+    ) %>%
     arrange(dataset_name, lag, driver_kind) %>%
     write.csv("graphs/fig3_prot2_monthly.csv", row.names = FALSE)

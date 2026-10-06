@@ -25,6 +25,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .auto_arima import (
@@ -677,6 +678,8 @@ def model_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
     training_file = str(_constant_value(predictions, "path_to_training_file"))
     metadata = _dataset_metadata(training_file)
     testing = predictions.loc[predictions["phase"].eq("testing")].copy()
+    if "date" in testing:
+        testing = testing.sort_values("date")
     actual = pd.to_numeric(testing[CASE_COLUMN], errors="coerce")
     forecast = pd.to_numeric(testing["prediction"], errors="coerce")
     scored = actual.notna() & forecast.notna()
@@ -694,6 +697,13 @@ def model_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
     mape = (
         float((absolute_errors.loc[nonzero] / actual.loc[nonzero].abs()).mean() * 100)
         if nonzero.any()
+        else float("nan")
+    )
+    actual_direction = actual.diff().iloc[1:].map(np.sign)
+    forecast_direction = forecast.diff().iloc[1:].map(np.sign)
+    directional_accuracy = (
+        float(actual_direction.eq(forecast_direction).mean() * 100)
+        if not actual_direction.empty
         else float("nan")
     )
     testing_dates = (
@@ -743,12 +753,13 @@ def model_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
         "total_absolute_error": total_absolute_error,
         "mape": mape,
         "mape_zero_actuals_excluded": int((~nonzero).sum()),
+        "directional_accuracy": directional_accuracy,
     }
     return pd.DataFrame([row])
 
 
 def save_model_metrics(predictions: pd.DataFrame, output: Path) -> Path:
-    """Save one model's metadata, AIC, AE, and MAPE immediately."""
+    """Save one model's metadata and evaluation metrics immediately."""
     output.parent.mkdir(parents=True, exist_ok=True)
     model_metrics(predictions).to_csv(output, index=False)
     LOGGER.info("Saved completed model metrics to %s", output)

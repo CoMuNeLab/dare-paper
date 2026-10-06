@@ -260,7 +260,7 @@ def _valid_prediction(path: Path) -> bool:
 
 
 def _valid_metrics(path: Path) -> bool:
-    required = {"model_id", "model_number", "ae", "mape"}
+    required = {"model_id", "model_number", "ae", "mape", "directional_accuracy"}
     try:
         frame = pd.read_csv(path)
     except (OSError, ValueError, pd.errors.ParserError):

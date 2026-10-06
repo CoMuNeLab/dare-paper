@@ -65,6 +65,59 @@ class AutoArimaThresholdTests(unittest.TestCase):
             self.assertEqual(fitted_model.order, (1, 0, 0))
             self.assertEqual(fitted_model.seasonal_order, (0, 0, 0, 52))
 
+    def test_retries_with_D_zero_after_seasonal_differencing_exhausts_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = self._dataset(root, "short", "weekly", [11, 12, 13])
+            configuration = root / "configuration.csv"
+            pd.DataFrame(
+                [self._configuration_row(dataset, "weekly")]
+            ).to_csv(configuration, index=False)
+            calls = []
+            fake_pmdarima = ModuleType("pmdarima")
+
+            def fake_auto_arima(y, **parameters):
+                calls.append(parameters)
+                if len(calls) == 1:
+                    raise ValueError(
+                        "There are no more samples after a first-order seasonal "
+                        "differencing."
+                    )
+                return FakeModel(parameters["m"])
+
+            fake_pmdarima.auto_arima = fake_auto_arima
+            fake_pmdarima.ARIMA = object
+
+            with (
+                patch.dict(os.environ, {"DATA_BASE_DIR": str(root)}),
+                patch.dict(sys.modules, {"pmdarima": fake_pmdarima}),
+            ):
+                outputs = list(iter_run(configuration))
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("D", calls[0])
+        self.assertEqual(calls[1]["D"], 0)
+
+    def test_does_not_retry_other_auto_arima_value_errors(self):
+        from ps_dare.auto_arima import _fit_auto_arima_with_fallback
+
+        calls = []
+
+        def failing_auto_arima(y, **parameters):
+            calls.append(parameters)
+            raise ValueError("different fitting failure")
+
+        with self.assertRaisesRegex(ValueError, "different fitting failure"):
+            _fit_auto_arima_with_fallback(
+                failing_auto_arima,
+                pd.Series([1, 2, 3]),
+                None,
+                52,
+            )
+
+        self.assertEqual(len(calls), 1)
+
     def test_standalone_run_writes_a_combined_predictor_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

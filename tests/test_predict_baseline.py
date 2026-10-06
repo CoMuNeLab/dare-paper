@@ -51,6 +51,7 @@ class PredictBaselineTests(unittest.TestCase):
         metrics = model_metrics(result).iloc[0]
         self.assertTrue(pd.isna(metrics["aic"]))
         self.assertAlmostEqual(metrics["mape"], (0.4 + 1 / 3) / 2 * 100)
+        self.assertAlmostEqual(metrics["directional_accuracy"], 100.0)
 
     def test_run_deduplicates_driver_variants_and_saves_metrics(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -77,6 +78,7 @@ class PredictBaselineTests(unittest.TestCase):
             saved_metrics = pd.read_csv(outputs[1])
             self.assertEqual(saved_metrics["model_id"].tolist(), ["baseline"])
             self.assertTrue(saved_metrics["aic"].isna().all())
+            self.assertEqual(saved_metrics["directional_accuracy"].tolist(), [100.0])
 
     def test_pipeline_style_row_preserves_model_number_in_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:

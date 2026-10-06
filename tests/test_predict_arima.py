@@ -406,6 +406,7 @@ class PredictArimaTests(unittest.TestCase):
         self.assertAlmostEqual(row["ae"], 3.0)
         self.assertAlmostEqual(row["total_absolute_error"], 6.0)
         self.assertAlmostEqual(row["mape"], 10.0)
+        self.assertAlmostEqual(row["directional_accuracy"], 100.0)
 
     def test_missing_testing_driver_ends_testing_phase(self):
         with tempfile.TemporaryDirectory() as temporary:
