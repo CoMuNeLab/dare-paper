@@ -1,4 +1,15 @@
+# PS-DARE paper analysis
+
+This repository builds the monthly and weekly PS-DARE analysis datasets,
+explores their case and environmental-driver series, and evaluates seasonal
+ARIMA and persistence-baseline forecasts. The forecasting workflow is designed
+to be restartable: each fitted model, order table, prediction series, and
+metrics row is saved as soon as it is completed.
+
 ## Environment
+
+The project requires Python 3.13. The supplied Conda environment also installs
+the R packages used by the publication-figure scripts.
 
 From the repository root:
 
@@ -7,41 +18,50 @@ conda env create -f environment.yml
 conda activate ps-dare-paper
 ```
 
-The environment installs this repository in editable mode, so source changes
-are available immediately without reinstalling it.
+The repository is installed in editable mode, so source changes are available
+without reinstalling it.
 
 ## Repository layout
 
 ```text
 data/
   monthly/
-    raw/                          Original monthly case datasets
-    drivers/{discrete,continuous,shared}/
-    aggregated/{discrete,continuous}/
+    raw/                          Monthly case datasets
+    drivers/{continuous,discrete,shared}/
+    aggregated/{continuous,discrete}/
   weekly/
-    raw/                          Original weekly case datasets
-    drivers/{discrete,continuous,shared}/
-    aggregated/{discrete,continuous}/
+    raw/                          Weekly case datasets
+    drivers/{continuous,discrete,shared}/
+    aggregated/{continuous,discrete}/
+  output/<timestamp>/             Durable model-run artifacts
+graphs/                            Generated figures and figure data
 src/ps_dare/
-  __main__.py    Dataset-building entry point
-  assembly.py    Dataset validation, merging, and batch assembly
-  explorer.py    Live case and driver plotting interface
-  paths.py       Repository and optional external-data path resolution
-tests/
+  __main__.py                     Dataset-building entry point
+  assembly.py                     Validation, merging, and batch assembly
+  explorer.py                     Interactive case/driver explorer
+  auto_arima.py                   Model expansion and order selection
+  predict_arima.py                Rolling ARIMA forecasts and metrics
+  predict_baseline.py             Rolling persistence baseline and metrics
+  arima_pipeline.py               End-to-end forecasting pipeline
+  recover_arima_pipeline.py       Interrupted-run recovery
+  fig1.ipynb, fig2.ipynb          Figure notebooks
+  fig3_prot1.R, fig3_prot2.R      Protocol-comparison figures
+tests/                             Unit and integration tests
 ```
 
-## Create the aggregated datasets
+Set `DATA_BASE_DIR` in a repository-root `.env` file when `data/` lives outside
+the repository. Relative paths are resolved below that directory; without the
+variable they are resolved from the repository root.
 
-After activating the environment, build all monthly and weekly datasets from
-the repository root:
+## Build the aggregated datasets
 
 ```bash
 python -m ps_dare
 ```
 
-The command combines every case dataset in `data/<frequency>/raw/` with the
-continuous and discrete driver files in `data/<frequency>/drivers/`. It writes
-both CSV and pickle versions to:
+This combines every case dataset in `data/<frequency>/raw/` with the continuous
+and discrete driver files in `data/<frequency>/drivers/`, writing CSV and
+pickle versions to:
 
 ```text
 data/monthly/aggregated/{continuous,discrete}/
@@ -49,156 +69,211 @@ data/weekly/aggregated/{continuous,discrete}/
 ```
 
 Existing aggregated files are overwritten. Driver-only dates are retained.
-Within the interval from the hospital's first case observation through its
-last observation, a missing case count is saved as `0`; dates before the case
-series starts or after it finishes retain a blank case count. Warnings printed
-during assembly identify missing periods, invalid dates, and case dates that
-have no matching driver observation.
+Within the interval from a hospital's first case observation through its last,
+a missing case count is stored as `0`; dates outside that interval keep a blank
+case count. Assembly warnings report invalid or missing periods, duplicate
+driver dates, and case dates without matching driver observations.
 
-Explore cases and drivers interactively:
-
-```bash
-python -m src.ps_dare.explorer
-```
-
-The selectors switch between monthly/weekly data, continuous/discrete driver
-files, datasets, CSV/pickle formats, and (when present) diagnosis categories.
-Cases remain visible in the upper panel while the selected drivers are updated
-live in the lower panel. The installed `ps-dare-explorer` command starts the
-same interface. Use `--data-dir /path/to/data` to select a different data
-directory explicitly.
-
-
-Estimate the model orders based on the discretization, driver, time limits, and
-lag specified in a CSV file:
+## Explore the datasets
 
 ```bash
-python -m src.ps_dare.auto_arima --jobs 6 auto_arima_example.csv
+ps-dare-explorer
+# Equivalent module command:
+python -m ps_dare.explorer
 ```
 
-The standalone selector saves each fitted model immediately and then produces
-one combined manifest at
-`data/output/<timestamp>/orders/orders_<timestamp>.csv`. Each manifest row contains
-the selected orders and the `model_file` path of the exact fitted model. Use
-the manifest printed as `Use for prediction` to run the prediction stage
-separately:
+The explorer switches among monthly and weekly data, continuous and discrete
+drivers, datasets, CSV and pickle formats, and diagnosis categories when they
+are present. Cases remain in the upper panel while selected drivers are drawn
+in the lower panel. Use `--data-dir /path/to/data` to inspect another data
+directory.
+
+## Analysis configuration
+
+Forecasting commands consume a CSV such as `auto_arima_example.csv` or one of
+the `protocol-*.csv` files. A minimal file is:
+
+```csv
+dataset,aggregation,driver_kind,discretization,train_start,train_end,test_end,lag
+ili_giustiniani,weekly,none,continuous,2017-01-01,2022-12-31,2025-12-31,0
+ili_giustiniani,weekly,weather,continuous,2017-01-01,2022-12-31,2025-12-31,0-1
+ili_giustiniani,weekly,baseline,continuous,2017-01-01,2022-12-31,2025-12-31,0
+```
+
+The columns have the following meaning:
+
+| Column | Accepted values and behavior |
+| --- | --- |
+| `dataset` | An absolute/relative CSV or pickle path, or a dataset name resolved as `data/<aggregation>/aggregated/<discretization>/<dataset>.csv` |
+| `aggregation` | `weekly`/`week` or `monthly`/`month` (`moth` is also accepted for compatibility) |
+| `driver_kind` | `none`, `weather`, `pollution`, `forced`, or `baseline` |
+| `discretization` | `continuous` or `discrete` |
+| `train_start`, `train_end` | Inclusive initial fitting window |
+| `test_end` | Inclusive end of the rolling evaluation window; required for prediction and baseline evaluation |
+| `lag` | `0`, `1`, or both (`0-1`, `0,1`, and `0/1` are equivalent) |
+| `category` | Optional diagnosis category; if omitted, categories are aggregated |
+
+Headers are normalized, so spaces may replace underscores and common aliases
+such as `frequency`, `training_start`, and `testing_end` are accepted.
+
+`weather` and `pollution` rows expand to one independent model per recognized
+driver found in the dataset. `none` fits seasonal ARIMA without an exogenous
+driver. `forced` fits `(1,1,1)(2,0,0)[m]` with an intercept and no exogenous
+driver, where `m` is 52 for weekly and 12 for monthly data. `baseline` uses the
+previous observed case count as the next one-step forecast; it has no fitted
+likelihood or confidence interval, so AIC, fitted parameters, and prediction
+bounds are blank.
+
+## Run the forecasting pipeline
+
+The usual entry point runs model expansion, Auto-ARIMA order selection, model
+persistence, rolling one-step prediction, and metric calculation:
 
 ```bash
-python -m src.ps_dare.predict_arima \
-  --orders data/output/20260915_114627/orders/orders_20260915_114627.csv \
-  --jobs 6
+ps-dare-arima-pipeline --jobs 6 protocol-1-lag0.csv protocol-1-lag1.csv
+# Equivalent module command:
+python -m ps_dare.arima_pipeline --jobs 6 protocol-1-lag0.csv protocol-1-lag1.csv
 ```
 
-Run order selection, model calibration/persistence, and rolling testing as one
-pipeline for one or more configuration files:
+Configuration files are processed in the supplied order. Within each file,
+`--jobs N` permits up to `N` complete model pipelines to run concurrently.
+Each worker finishes and saves one model before accepting another, bounding
+live model memory. Omit `--jobs` for deterministic single-process execution.
+Rows with `driver_kind=baseline` are scored directly without fitting ARIMA.
 
-```bash
-python -m src.ps_dare.arima_pipeline --jobs 6 auto_arima_example_def_1.csv auto_arima_example_def_2.csv auto_arima_example_def_3.csv
-```
+Auto-ARIMA uses seasonal stepwise selection. If its first seasonal-differencing
+attempt exhausts the available training samples, selection retries that model
+with `D=0`; other fitting errors are logged and the pipeline continues with the
+next model. `forced` rows bypass order selection.
 
-The installed equivalent is `ps-dare-arima-pipeline`. Configurations are
-processed in the order supplied. For each one, testing starts automatically as
-soon as its Auto-ARIMA order table has been saved. Rows whose `driver_kind` is
-`forced` retain their explicitly defined order; all other eligible rows use
-Auto-ARIMA. `--jobs` controls how many complete model pipelines are processed
-concurrently. Each worker selects and saves one fitted model, saves all of its
-rolling predictions, and exits before another model is assigned; this bounds
-live model memory to the requested process count. Omit `--jobs` for
-deterministic single-process execution. Pipeline
-messages are shown in the terminal and saved to a timestamped file under
-`logs/`. Pass `--log-file path/to/pipeline.log` to choose a different file.
-The fitted model produced during order selection is immediately serialized;
-rolling prediction loads that exact training fit instead of fitting a second
-model from the selected orders.
+Pipeline messages appear in the terminal and are also written to
+`logs/arima_pipeline_<timestamp>.log`. Use `--log-file PATH` to choose another
+location.
 
-If a pipeline is interrupted, continue it by passing its log file to the
-recovery command:
+### Rolling update modes
 
-```bash
-ps-dare-arima-recover logs/arima_pipeline_20260915_163546.log
-```
-
-The equivalent module command is
-`python -m src.ps_dare.recover_arima_pipeline LOG_FILE`. Recovery reuses the
-configuration, artifact timestamp, and prediction update mode recorded in the
-log. It verifies every model's files, skips completed models, rebuilds missing
-metrics from completed prediction CSVs, resumes prediction from saved fitted
-models, and refits only models that have no usable order/model artifact.
-Recovery messages are appended to the same log. Use `--jobs N` to override the
-original concurrency.
-
-Rolling updates use pmdarima's default MLE recalibration when no update option
-is supplied. Two mutually exclusive faster modes are available:
+By default, each observed testing value is passed to pmdarima's `update`
+method with its normal maximum-likelihood recalibration before the next
+forecast. Two mutually exclusive faster modes are available:
 
 ```bash
 # Keep fitted coefficients fixed and update only the forecasting state.
-python -m src.ps_dare.arima_pipeline --state-only-updates --jobs 6 auto_arima_example.csv
+ps-dare-arima-pipeline --state-only-updates --jobs 6 protocol-1-lag0.csv
 
-# Keep recalibration, but limit every observation update to one MLE iteration.
-python -m src.ps_dare.arima_pipeline --update-maxiter 1 --jobs 6 auto_arima_example.csv
+# Recalibrate, but limit each observation update to one MLE iteration.
+ps-dare-arima-pipeline --update-maxiter 1 --jobs 6 protocol-1-lag0.csv
 ```
 
-The same `--state-only-updates` and `--update-maxiter N` options are available
-on `ps-dare-predict`. They cannot be combined. Prediction CSVs record the
-selected strategy in `update_mode` and `update_maxiter`.
+Prediction CSVs record the choice in `update_mode` and `update_maxiter`.
 
-Alternatively, the positional form remains supported for an existing orders
-file:
+### Recover an interrupted run
+
+Pass the original pipeline log to the recovery command:
 
 ```bash
-python -m src.ps_dare.predict_arima data/output/20260915_114627/orders/orders_20260915_114627.csv
+ps-dare-arima-recover logs/arima_pipeline_20260921_125305.log
+# Equivalent module command:
+python -m ps_dare.recover_arima_pipeline logs/arima_pipeline_20260921_125305.log
 ```
 
-Each saved model is calibrated once on its configured training period. After
-each prediction, the observed access count is passed to the model's `update`
-method before predicting the next period. Each model's long-form output keeps
-the complete access series, the selected driver and its value when applicable,
-and predictions with their 95% confidence interval lower and upper bounds for
-the configured testing window. A completed simulation is immediately written
-to its own file at
-`data/output/<timestamp>/<weekly|monthly>/predictions/<dataset>/<dataset>_<driver>_<aggregation>_lag_<lag>_model_<NNN>_<timestamp>.csv`.
-For example:
-`general_no2_mean_weekly_lag_1_model_007_20260914_153012.csv`.
-Completed simulation DataFrames are never retained while other models finish,
-so an interrupted batch preserves every finished result file.
+Recovery reuses the configurations, artifact timestamp, concurrency, and
+update mode recorded in the log. It validates the durable files, skips
+completed ARIMA models, rebuilds missing metrics from completed prediction
+CSVs, resumes prediction from saved fitted models, and refits models only when
+no usable order/model artifact exists. Messages are appended to the same log.
+Use `--jobs N` to override concurrency, or one of `--state-only-updates`,
+`--update-maxiter N`, and `--default-updates` to override the recorded update
+mode.
 
-After each prediction file is saved, the same worker writes a one-row model
-summary with the identical filename under
-`data/output/<timestamp>/<weekly|monthly>/metrics/<dataset>/`. This metrics CSV includes the model
-number and ID, dataset name and path, hospital, subset, category, temporal
-aggregation, driver and lag, discretization, training/testing dates and sample
-counts, ARIMA orders, intercept, update strategy, fitted parameters, model
-path, training AIC, AE, total absolute error, and MAPE. `ae` is the mean
-absolute error over scored testing predictions. `mape` is expressed as a
-percentage; observations whose actual value is zero are excluded and counted
-in `mape_zero_actuals_excluded`. The worker does not proceed to another model
-until both its prediction and metrics files have been written.
+## Run individual stages
 
-The prediction output also stores `training_aic` and `fitted_parameters`. These
-are captured immediately after the initial training fit, before rolling test
-observations update the model. `fitted_parameters` is a JSON object containing
-parallel `parameters` and `pvalues` mappings from coefficient names to values.
-To calculate out-of-sample MAPE, use only rows
-whose `phase` is `testing`, comparing `n_accesses` with `prediction`. The
-metrics stage applies the zero-actual policy described above.
+Select orders and persist fitted models without running predictions:
 
-Every pipeline execution writes its artifacts below
-`data/output/<timestamp>/` and copies each analysis-directives CSV into that
-directory. Inside it, the existing `weekly`/`monthly` hierarchy is preserved
-for predictions, metrics, models, and orders.
+```bash
+python -m ps_dare.auto_arima --jobs 6 auto_arima_example.csv
+```
 
-Every initial training fit is serialized by Auto-ARIMA, before its order table
-is published, as a pickle file under
-`data/output/<timestamp>/<weekly|monthly>/models/<dataset>/`. The dataset
-directory, model ID (including the driver), row number, and orders-file
-timestamp uniquely identify the fitted model. Both the order table and the
-prediction CSV record its path in `model_file`; prediction loads this artifact
-without refitting it. Only load pickle files produced by a trusted source,
-because unpickling can execute arbitrary code.
+The selector writes a one-row order artifact for every completed model and a
+combined manifest at
+`data/output/<timestamp>/orders/orders_<timestamp>.csv`. The manifest includes
+the selected orders and the exact fitted model's `model_file` path. Use the
+path printed after `Use for prediction`:
 
-For models with an exogenous driver, testing stops before the first period
-whose required lagged driver value is unavailable. That period and every later
-period are labeled `after_testing` instead of causing prediction to fail.
+```bash
+ps-dare-predict \
+  --orders data/output/<timestamp>/orders/orders_<timestamp>.csv \
+  --jobs 6
+```
 
-Set `DATA_BASE_DIR` in `.env` when the `data/` directory lives outside this
-repository.
+The orders path may instead be passed positionally. `ps-dare-predict` supports
+the same `--state-only-updates` and `--update-maxiter N` options as the full
+pipeline.
+
+Evaluate persistence baselines separately for the unique evaluation windows
+described by one or more configuration files:
+
+```bash
+ps-dare-baseline protocol-1-lag0.csv protocol-1-lag1.csv
+# Equivalent module command:
+python -m ps_dare.predict_baseline protocol-1-lag0.csv protocol-1-lag1.csv
+```
+
+## Outputs and metrics
+
+Every pipeline run copies its configuration CSVs and saves artifacts below a
+single run directory:
+
+```text
+data/output/<timestamp>/
+  <configuration>.csv
+  <weekly|monthly>/
+    models/<dataset>/              Serialized fitted ARIMA models
+    orders/<model-id>/             One-row order tables
+    predictions/<dataset>/         Full long-form series and rolling forecasts
+    metrics/<dataset>/             One-row model summaries
+    orders/skipped.csv             Ineligible specifications, when present
+```
+
+Each ARIMA fit is serialized before its order table is published. Prediction
+loads that exact fit rather than fitting a second model from the selected
+orders. Only unpickle model files from a trusted source, because loading a
+pickle can execute arbitrary code.
+
+Prediction files retain the complete series and label rows as
+`before_training`, `training`, `testing`, or `after_testing`. Testing rows
+contain the one-step forecast and its 95% confidence bounds. For an exogenous
+model, testing stops before the first period whose required lagged driver value
+is unavailable; that period and all later periods are labeled `after_testing`.
+Training AIC and fitted coefficient estimates/p-values are captured before
+rolling updates begin.
+
+Each metrics CSV includes model and dataset metadata, fitting and evaluation
+windows, ARIMA orders, update strategy, fitted parameters, model path,
+training AIC, and these out-of-sample measures:
+
+- `ae`: mean absolute error over scored testing forecasts.
+- `total_absolute_error`: sum of absolute errors.
+- `mape`: mean absolute percentage error, in percent. Zero actuals are omitted
+  and counted in `mape_zero_actuals_excluded`.
+- `directional_accuracy`: percentage of consecutive testing steps for which
+  the forecast and actual series move in the same direction (including ties).
+
+Baseline artifacts use the same prediction and metrics layout, with the
+model-specific fields left blank where they do not apply.
+
+## Figures
+
+`src/ps_dare/fig1.ipynb` and `fig2.ipynb` contain the Python figure workflows.
+`fig3_prot1.R` and `fig3_prot2.R` generate the protocol-comparison figures and
+use `reticulate` with the `ps-dare-paper` Conda environment to inspect fitted
+pmdarima models. Generated PDFs and supporting CSVs are stored in `graphs/`.
+Review the input paths near the top of each notebook or R script before
+rerunning it for a different output run.
+
+## Tests
+
+Run the test suite from the activated environment:
+
+```bash
+pytest
+```
