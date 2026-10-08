@@ -55,6 +55,9 @@ variable they are resolved from the repository root.
 
 ## Build the aggregated datasets
 
+See [`README_data.md`](README_data.md) for the complete input-file matrix,
+schemas, date-alignment rules, join behavior, and missing-data policy.
+
 ```bash
 python -m ps_dare
 ```
